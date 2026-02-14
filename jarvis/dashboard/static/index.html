@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WINSTON</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --bg-panel: #ffffff;
+    --border: #d2d2d7;
+    --text: #1d1d1f;
+    --text-dim: #86868b;
+    --blue: #007AFF;
+    --green: #34C759;
+    --purple: #AF52DE;
+    --orange: #FF9500;
+    --red: #FF3B30;
+    --accent: var(--blue);
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,0.06), 0 2px 6px rgba(0,0,0,0.03);
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .logo {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    color: var(--text);
+  }
+  .state-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    padding: 5px 14px;
+    border-radius: 14px;
+    background: rgba(0, 122, 255, 0.08);
+    color: var(--blue);
+    transition: all 0.5s ease;
+  }
+  .talk-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 18px;
+    border-radius: 18px;
+    background: var(--blue);
+    color: white;
+    border: none;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: inherit;
+  }
+  .talk-btn:hover { background: #0066d6; transform: scale(1.02); }
+  .talk-btn:active { background: #0055b3; transform: scale(0.98); }
+  .talk-btn.secondary {
+    background: #e8e8ed;
+    color: var(--text);
+  }
+  .talk-btn.secondary:hover { background: #dcdce2; }
+  .talk-btn svg { width: 14px; height: 14px; }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .modules {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .module-dot {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+  }
+  .module-dot .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--border);
+    transition: background 0.5s;
+  }
+  .module-dot .dot.online { background: var(--green); }
+  .module-dot .dot.loading {
+    background: var(--orange);
+    animation: pulse-dot 1s ease-in-out infinite;
+  }
+  .module-dot .dot.error { background: var(--red); }
+  .uptime {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .oww-hint {
+    font-size: 10px;
+    color: var(--orange);
+    font-weight: 500;
+    display: none;
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* Neural Core Section */
+  .core-section {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 340px;
+    overflow: hidden;
+    background: linear-gradient(180deg, #eef0f3 0%, var(--bg) 100%);
+  }
+  #neural-core {
+    display: block;
+  }
+
+  /* Info Grid */
+  .info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1.3fr 1fr;
+    gap: 16px;
+    padding: 16px;
+    min-height: calc(100vh - 340px - 49px);
+  }
+  .panel {
+    background: var(--bg-panel);
+    border-radius: 16px;
+    padding: 20px;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    overflow-y: auto;
+  }
+  .panel-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Camera Panel */
+  .camera-feed {
+    width: 100%;
+    border-radius: 12px;
+    background: #e8e8ed;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    box-shadow: var(--shadow);
+  }
+  .scene-desc {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.6;
+    min-height: 40px;
+  }
+
+  /* Conversation Panel */
+  .conversation {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: calc(100vh - 340px - 49px - 80px);
+    overflow-y: auto;
+  }
+  .msg {
+    padding: 10px 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    max-width: 85%;
+    word-wrap: break-word;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: var(--blue);
+    color: white;
+    border-radius: 18px 18px 4px 18px;
+  }
+  .msg.winston {
+    align-self: flex-start;
+    background: #e9e9eb;
+    color: var(--text);
+    border-radius: 18px 18px 18px 4px;
+  }
+  .msg.proactive {
+    align-self: flex-start;
+    background: #f3edfa;
+    color: #6d28a0;
+    border-radius: 18px 18px 18px 4px;
+    border-left: 3px solid var(--purple);
+  }
+  .msg-time {
+    font-size: 10px;
+    color: rgba(0,0,0,0.35);
+    margin-top: 4px;
+  }
+  .msg.user .msg-time { color: rgba(255,255,255,0.6); }
+  .empty-state {
+    color: var(--text-dim);
+    font-size: 13px;
+    text-align: center;
+    padding: 40px 20px;
+  }
+
+  /* System Panel */
+  .sys-section {
+    margin-bottom: 18px;
+  }
+  .sys-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .sys-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    padding: 4px 0;
+    color: var(--text);
+  }
+  .sys-row .label { color: var(--text-dim); }
+  .sys-row .value { font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* Audio Level Bar */
+  .audio-bar-container {
+    height: 6px;
+    background: #e8e8ed;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .audio-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--blue), var(--green));
+    border-radius: 3px;
+    transition: width 0.08s linear;
+  }
+
+  /* Cost Bar */
+  .cost-bar-container {
+    height: 5px;
+    background: #e8e8ed;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .cost-bar {
+    height: 100%;
+    width: 0%;
+    background: var(--blue);
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+  .cost-bar.warn { background: var(--orange); }
+  .cost-bar.danger { background: var(--red); }
+
+  /* Module load times */
+  .load-time-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    padding: 3px 0;
+  }
+  .load-time-row .name { color: var(--text-dim); text-transform: capitalize; }
+  .load-time-row .time { color: var(--green); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* Observations */
+  .obs-item {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-bottom: 8px;
+    padding-left: 10px;
+    border-left: 2px solid var(--border);
+  }
+  .obs-time {
+    font-size: 10px;
+    color: var(--border);
+    font-weight: 500;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #c7c7cc; border-radius: 3px; }
+
+  /* Connection status */
+  .conn-status {
+    position: fixed;
+    bottom: 12px;
+    right: 12px;
+    font-size: 10px;
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: 12px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    box-shadow: var(--shadow);
+    z-index: 100;
+  }
+  .conn-status.connected { border-color: var(--green); color: var(--green); }
+  .conn-status.disconnected { border-color: var(--red); color: var(--red); }
+
+  /* Bottom Grid — Agent Tasks + Notes */
+  .info-grid-bottom {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 0 16px 16px;
+  }
+
+  /* Agent task cards */
+  .agent-task {
+    padding: 12px;
+    border-left: 3px solid var(--blue);
+    background: rgba(0, 122, 255, 0.04);
+    border-radius: 8px;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .agent-task.running { border-left-color: var(--orange); }
+  .agent-task.failed { border-left-color: var(--red); }
+  .agent-task.completed { border-left-color: var(--green); }
+  .agent-task .task-status {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 1px;
+  }
+  .agent-task .task-query {
+    color: var(--text-dim);
+    margin: 4px 0;
+    line-height: 1.4;
+  }
+  .agent-task .task-result {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    color: var(--text);
+    white-space: pre-wrap;
+    max-height: 100px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .agent-task .task-time {
+    font-size: 10px;
+    color: var(--border);
+    margin-top: 6px;
+  }
+
+  /* Note items — interactive checklist */
+  .note-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--bg);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    font-size: 13px;
+  }
+  .note-item.done .note-text {
+    text-decoration: line-through;
+    color: var(--text-dim);
+  }
+  .note-check {
+    cursor: pointer;
+    width: 20px;
+    height: 20px;
+    min-width: 20px;
+    border: 2px solid var(--border);
+    border-radius: 6px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+  }
+  .note-check:hover { border-color: var(--blue); }
+  .note-check.checked {
+    background: var(--green);
+    border-color: var(--green);
+  }
+  .note-check.checked::after {
+    content: '\2713';
+    color: white;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .note-text { flex: 1; line-height: 1.4; }
+  .note-meta { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+  .note-delete {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 18px;
+    line-height: 1;
+    opacity: 0.3;
+    transition: all 0.2s ease;
+    padding: 0 2px;
+  }
+  .note-delete:hover { opacity: 1; color: var(--red); }
+
+  @keyframes pulse-border {
+    0%, 100% { border-left-color: var(--orange); }
+    50% { border-left-color: rgba(255, 149, 0, 0.3); }
+  }
+  .agent-task.running { animation: pulse-border 2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div class="logo">WINSTON</div>
+    <div class="state-label" id="state-label">INITIALIZING</div>
+  </div>
+  <div class="header-right">
+    <button class="talk-btn" id="talk-btn" onclick="dashboard.triggerListen()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      Talk to Winston
+    </button>
+    <div class="modules">
+      <div class="module-dot"><span class="dot" id="dot-camera"></span>CAM</div>
+      <div class="module-dot"><span class="dot" id="dot-audio"></span>MIC</div>
+      <div class="module-dot"><span class="dot" id="dot-memory"></span>MEM</div>
+      <div class="module-dot"><span class="dot" id="dot-gemini"></span>AI</div>
+      <div class="module-dot"><span class="dot" id="dot-tts"></span>TTS</div>
+    </div>
+    <span class="uptime" id="uptime">00:00:00</span>
+  </div>
+</div>
+
+<!-- Neural Core -->
+<div class="core-section">
+  <canvas id="neural-core"></canvas>
+</div>
+
+<!-- Info Grid -->
+<div class="info-grid">
+  <!-- Camera Panel -->
+  <div class="panel">
+    <div class="panel-title">Camera Feed</div>
+    <img class="camera-feed" id="camera-feed" src="/camera/stream" alt="Camera">
+    <div class="scene-desc" id="scene-desc">Waiting for scene analysis...</div>
+  </div>
+
+  <!-- Conversation Panel -->
+  <div class="panel">
+    <div class="panel-title">Conversation</div>
+    <div class="conversation" id="conversation">
+      <div class="empty-state">Press the Talk button or just start speaking</div>
+    </div>
+  </div>
+
+  <!-- System Panel -->
+  <div class="panel">
+    <div class="panel-title">System</div>
+
+    <div class="sys-section">
+      <div class="sys-section-title">Audio Level</div>
+      <div class="audio-bar-container">
+        <div class="audio-bar" id="audio-bar"></div>
+      </div>
+    </div>
+
+    <div class="sys-section">
+      <div class="sys-section-title">Startup</div>
+      <div id="load-times"></div>
+    </div>
+
+    <div class="sys-section">
+      <div class="sys-section-title">Memory</div>
+      <div class="sys-row">
+        <span class="label">Episodes</span>
+        <span class="value" id="mem-episodes">0</span>
+      </div>
+      <div class="sys-row">
+        <span class="label">Facts</span>
+        <span class="value" id="mem-facts">0</span>
+      </div>
+    </div>
+
+    <div class="sys-section">
+      <div class="sys-section-title">API Cost</div>
+      <div class="sys-row">
+        <span class="label">Today</span>
+        <span class="value" id="cost-value">$0.00</span>
+      </div>
+      <div class="cost-bar-container">
+        <div class="cost-bar" id="cost-bar"></div>
+      </div>
+    </div>
+
+    <div class="sys-section">
+      <div class="sys-section-title">Observations</div>
+      <div id="observations"><span class="obs-item" style="border:none;padding:0;">No observations yet</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Bottom Grid — Agent Tasks + Notes -->
+<div class="info-grid-bottom">
+  <div class="panel">
+    <div class="panel-title">Agent Investigations</div>
+    <div id="agent-tasks">
+      <span class="empty-state">No investigations yet</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Notes</div>
+    <div id="notes-list">
+      <span class="empty-state">Say "write this down" to add a note</span>
+    </div>
+  </div>
+</div>
+
+<div class="conn-status disconnected" id="conn-status">DISCONNECTED</div>
+
+<script>
+// ==========================================
+// Neural Core — Elegant Particle Visualization
+// ==========================================
+class NeuralCore {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.particles = [];
+    this.state = 'initializing';
+    this.targetState = 'initializing';
+    this.audioLevel = 0;
+    this.time = 0;
+
+    // Color (smoothly interpolated)
+    this.color = { r: 0, g: 122, b: 255 };
+    this.targetColor = { r: 0, g: 122, b: 255 };
+
+    // Parameters (smoothly interpolated)
+    this.params = { speed: 1, gravity: 0, spread: 1, pulseRate: 1, glowSize: 15 };
+    this.targetParams = { ...this.params };
+
+    this.resize();
+    this.initParticles();
+
+    window.addEventListener('resize', () => this.resize());
+  }
+
+  resize() {
+    const section = this.canvas.parentElement;
+    this.canvas.width = section.clientWidth;
+    this.canvas.height = section.clientHeight;
+    this.cx = this.canvas.width / 2;
+    this.cy = this.canvas.height / 2;
+  }
+
+  initParticles() {
+    const count = 160;
+    for (let i = 0; i < count; i++) {
+      const layer = i < 35 ? 0 : i < 90 ? 1 : 2;
+      const baseRadius = layer === 0 ? 50 : layer === 1 ? 100 : 160;
+      const angle = Math.random() * Math.PI * 2;
+      const radius = baseRadius + (Math.random() - 0.5) * 25;
+
+      this.particles.push({
+        angle,
+        radius,
+        baseRadius,
+        layer,
+        size: 0.6 + Math.random() * 1.2,
+        alpha: 0.2 + Math.random() * 0.4,
+        speed: (0.002 + Math.random() * 0.003) * (layer === 0 ? 1.5 : layer === 1 ? 1 : 0.5),
+        offset: Math.random() * Math.PI * 2,
+        x: 0, y: 0,
+      });
+    }
+  }
+
+  setState(newState) {
+    if (newState === this.targetState) return;
+    this.targetState = newState;
+
+    const states = {
+      initializing: { color: { r: 160, g: 168, b: 176 }, speed: 0.5, gravity: 0, spread: 1, pulseRate: 0.5, glowSize: 10 },
+      idle:         { color: { r: 0, g: 122, b: 255 },   speed: 1,   gravity: 0, spread: 1, pulseRate: 1,   glowSize: 15 },
+      listening:    { color: { r: 52, g: 199, b: 89 },    speed: 1.5, gravity: 0.3, spread: 0.7, pulseRate: 2, glowSize: 20 },
+      thinking:     { color: { r: 175, g: 82, b: 222 },   speed: 3,   gravity: -0.2, spread: 1.4, pulseRate: 3, glowSize: 25 },
+      speaking:     { color: { r: 255, g: 149, b: 0 },    speed: 1.2, gravity: 0, spread: 1.1, pulseRate: 2, glowSize: 20 },
+    };
+
+    const s = states[newState] || states.idle;
+    this.targetColor = s.color;
+    this.targetParams = { speed: s.speed, gravity: s.gravity, spread: s.spread, pulseRate: s.pulseRate, glowSize: s.glowSize };
+  }
+
+  lerp(a, b, t) { return a + (b - a) * t; }
+
+  update(dt) {
+    this.time += dt;
+    const t = 0.035;
+
+    this.color.r = this.lerp(this.color.r, this.targetColor.r, t);
+    this.color.g = this.lerp(this.color.g, this.targetColor.g, t);
+    this.color.b = this.lerp(this.color.b, this.targetColor.b, t);
+
+    for (const k of Object.keys(this.params)) {
+      this.params[k] = this.lerp(this.params[k], this.targetParams[k], t);
+    }
+
+    const audioBoost = 1 + this.audioLevel * 3;
+
+    for (const p of this.particles) {
+      p.angle += p.speed * this.params.speed * dt * 60 * (1 + this.audioLevel * 0.5);
+
+      const gravityEffect = this.params.gravity * 0.5;
+      const targetRadius = p.baseRadius * this.params.spread + gravityEffect * -50;
+      p.radius = this.lerp(p.radius, targetRadius, 0.02);
+
+      const audioDisplace = this.audioLevel * 12 * Math.sin(this.time * 3 + p.offset);
+      const pulse = Math.sin(this.time * this.params.pulseRate + p.offset) * 4;
+
+      p.x = this.cx + Math.cos(p.angle) * (p.radius + pulse + audioDisplace);
+      p.y = this.cy + Math.sin(p.angle) * (p.radius + pulse + audioDisplace);
+    }
+  }
+
+  render() {
+    const ctx = this.ctx;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const { r, g, b } = this.color;
+
+    // Light trail fade
+    ctx.fillStyle = 'rgba(238, 240, 243, 0.25)';
+    ctx.fillRect(0, 0, w, h);
+
+    // Connections between nearby particles
+    ctx.lineWidth = 0.4;
+    for (let i = 0; i < this.particles.length; i++) {
+      for (let j = i + 1; j < this.particles.length; j++) {
+        const a = this.particles[i];
+        const bP = this.particles[j];
+        const dx = a.x - bP.x;
+        const dy = a.y - bP.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 55) {
+          const alpha = (1 - dist / 55) * 0.12;
+          ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(bP.x, bP.y);
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Particles
+    for (const p of this.particles) {
+      const alpha = p.alpha * (0.5 + 0.5 * Math.sin(this.time * 2 + p.offset));
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.3)`;
+      ctx.shadowBlur = 4;
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+
+    // Core glow (softer)
+    const coreSize = this.params.glowSize + Math.sin(this.time * this.params.pulseRate) * 4 + this.audioLevel * 15;
+    const gradient = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, coreSize * 2.5);
+    gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.25)`);
+    gradient.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, 0.06)`);
+    gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+    ctx.beginPath();
+    ctx.arc(this.cx, this.cy, coreSize * 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    // Inner core
+    ctx.beginPath();
+    ctx.arc(this.cx, this.cy, coreSize * 0.25, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.6)`;
+    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.5)`;
+    ctx.shadowBlur = 15;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Speaking ripples
+    if (this.targetState === 'speaking' && this.audioLevel > 0.01) {
+      for (let i = 0; i < 3; i++) {
+        const phase = (this.time * 1.5 + i * 0.7) % 3;
+        const rippleR = phase * 70;
+        const rippleAlpha = Math.max(0, 0.1 - phase * 0.035);
+        ctx.beginPath();
+        ctx.arc(this.cx, this.cy, rippleR, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${rippleAlpha})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    // State label
+    ctx.font = '500 10px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.35)`;
+    ctx.letterSpacing = '2px';
+    ctx.fillText(this.targetState.toUpperCase(), this.cx, this.cy + coreSize * 2.5 + 18);
+  }
+}
+
+// ==========================================
+// Dashboard Controller
+// ==========================================
+class Dashboard {
+  constructor() {
+    this.ws = null;
+    this.lastConversationLen = 0;
+    this.reconnectTimeout = null;
+    this.wakeWordReady = false;
+
+    this.el = {
+      stateLabel: document.getElementById('state-label'),
+      uptime: document.getElementById('uptime'),
+      cameraFeed: document.getElementById('camera-feed'),
+      sceneDesc: document.getElementById('scene-desc'),
+      conversation: document.getElementById('conversation'),
+      audioBar: document.getElementById('audio-bar'),
+      loadTimes: document.getElementById('load-times'),
+      memEpisodes: document.getElementById('mem-episodes'),
+      memFacts: document.getElementById('mem-facts'),
+      costValue: document.getElementById('cost-value'),
+      costBar: document.getElementById('cost-bar'),
+      observations: document.getElementById('observations'),
+      connStatus: document.getElementById('conn-status'),
+      talkBtn: document.getElementById('talk-btn'),
+      owwHint: document.getElementById('oww-hint'),
+      agentTasks: document.getElementById('agent-tasks'),
+      notesList: document.getElementById('notes-list'),
+    };
+
+    this.dots = {};
+    for (const m of ['camera', 'audio', 'memory', 'gemini', 'tts']) {
+      this.dots[m] = document.getElementById('dot-' + m);
+    }
+
+    this.core = new NeuralCore(document.getElementById('neural-core'));
+
+    this.connect();
+    this.animate();
+  }
+
+  connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    this.ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    this.ws.onopen = () => {
+      this.el.connStatus.textContent = 'CONNECTED';
+      this.el.connStatus.className = 'conn-status connected';
+    };
+
+    this.ws.onclose = () => {
+      this.el.connStatus.textContent = 'DISCONNECTED';
+      this.el.connStatus.className = 'conn-status disconnected';
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = setTimeout(() => this.connect(), 2000);
+    };
+
+    this.ws.onerror = () => {};
+
+    this.ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'state') this.handleState(msg.data);
+      if (msg.type === 'audio') this.handleAudio(msg.data);
+    };
+  }
+
+  handleState(data) {
+    // Status & Neural Core
+    this.core.setState(data.status);
+    this.el.stateLabel.textContent = data.status.toUpperCase();
+    const colorMap = {
+      idle: { c: 'var(--blue)', bg: 'rgba(0,122,255,0.08)' },
+      listening: { c: 'var(--green)', bg: 'rgba(52,199,89,0.08)' },
+      thinking: { c: 'var(--purple)', bg: 'rgba(175,82,222,0.08)' },
+      speaking: { c: 'var(--orange)', bg: 'rgba(255,149,0,0.08)' },
+      initializing: { c: 'var(--text-dim)', bg: 'rgba(134,134,139,0.08)' },
+    };
+    const st = colorMap[data.status] || colorMap.idle;
+    this.el.stateLabel.style.color = st.c;
+    this.el.stateLabel.style.background = st.bg;
+
+    // Wake word status & Talk button
+    this.wakeWordReady = data.wakeWordReady;
+
+    // Uptime
+    const secs = Math.floor(data.uptime);
+    const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
+    const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+    const ss = String(secs % 60).padStart(2, '0');
+    this.el.uptime.textContent = `${hh}:${mm}:${ss}`;
+
+    // Module dots
+    for (const [name, info] of Object.entries(data.modules)) {
+      const dot = this.dots[name];
+      if (dot) dot.className = 'dot ' + info.status;
+    }
+
+    // Load times
+    const timesHtml = Object.entries(data.modules).map(([name, info]) => {
+      const t = info.load_time_ms;
+      const timeStr = t != null ? (t > 1000 ? (t / 1000).toFixed(1) + 's' : Math.round(t) + 'ms') : '...';
+      return `<div class="load-time-row"><span class="name">${name}</span><span class="time">${timeStr}</span></div>`;
+    }).join('');
+    this.el.loadTimes.innerHTML = timesHtml;
+
+    // Audio
+    this.core.audioLevel = data.audioLevel;
+    this.el.audioBar.style.width = Math.min(100, data.audioLevel * 500) + '%';
+
+    // Memory
+    this.el.memEpisodes.textContent = data.memoryEpisodes;
+    this.el.memFacts.textContent = data.memoryFacts;
+
+    // Cost
+    this.el.costValue.textContent = '$' + data.costToday.toFixed(2) + ' / $' + data.budgetMax.toFixed(2);
+    const costPct = (data.costToday / data.budgetMax) * 100;
+    this.el.costBar.style.width = Math.min(100, costPct) + '%';
+    this.el.costBar.className = 'cost-bar' + (costPct > 90 ? ' danger' : costPct > 75 ? ' warn' : '');
+
+    // Conversation
+    if (data.conversation.length !== this.lastConversationLen) {
+      this.lastConversationLen = data.conversation.length;
+      if (data.conversation.length === 0) {
+        this.el.conversation.innerHTML = '<div class="empty-state">Press the Talk button or just start speaking</div>';
+      } else {
+        this.el.conversation.innerHTML = data.conversation.map(m => {
+          const cls = m.role === 'user' ? 'user' : m.role === 'proactive' ? 'proactive' : 'winston';
+          return `<div class="msg ${cls}">${this.escapeHtml(m.text)}<div class="msg-time">${m.timestamp}</div></div>`;
+        }).join('');
+        this.el.conversation.scrollTop = this.el.conversation.scrollHeight;
+      }
+    }
+
+    // Observations
+    const obs = data.observations.slice(-5);
+    this.el.observations.innerHTML = obs.length
+      ? obs.map(o => `<div class="obs-item"><span class="obs-time">${o.timestamp}</span> ${this.escapeHtml(o.description)}</div>`).join('')
+      : '<span class="obs-item" style="border:none;padding:0;">No observations yet</span>';
+
+    // Scene description
+    if (obs.length > 0) {
+      this.el.sceneDesc.textContent = obs[obs.length - 1].description;
+    }
+
+    // Agent Tasks
+    const tasks = data.agentTasks || [];
+    if (tasks.length > 0) {
+      this.el.agentTasks.innerHTML = tasks.slice(-10).reverse().map(t => {
+        const statusColor = t.status === 'running' ? 'var(--orange)' : t.status === 'completed' ? 'var(--green)' : 'var(--red)';
+        const resultHtml = t.result
+          ? `<div class="task-result">${this.escapeHtml(t.result.substring(0, 500))}</div>`
+          : (t.status === 'running' ? '<div class="task-result" style="color:var(--orange)">Investigating...</div>' : '');
+        return `<div class="agent-task ${t.status}">
+          <div class="task-status" style="color:${statusColor}">${t.status}</div>
+          <div class="task-query">${this.escapeHtml(t.query || '')}</div>
+          ${resultHtml}
+          <div class="task-time">${t.created_at || ''}</div>
+        </div>`;
+      }).join('');
+    } else {
+      this.el.agentTasks.innerHTML = '<span class="empty-state">No investigations yet</span>';
+    }
+
+    // Notes
+    const notes = data.notes || [];
+    if (notes.length > 0) {
+      this.el.notesList.innerHTML = notes.map(n => `
+        <div class="note-item ${n.done ? 'done' : ''}" data-id="${n.id}">
+          <div class="note-check ${n.done ? 'checked' : ''}" onclick="dashboard.toggleNote('${n.id}')"></div>
+          <div style="flex:1">
+            <div class="note-text">${this.escapeHtml(n.text)}</div>
+            <div class="note-meta">${n.created_at ? new Date(n.created_at).toLocaleString() : ''}</div>
+          </div>
+          <div class="note-delete" onclick="dashboard.deleteNote('${n.id}')">&times;</div>
+        </div>
+      `).join('');
+    } else {
+      this.el.notesList.innerHTML = '<span class="empty-state">Say "write this down" to add a note</span>';
+    }
+  }
+
+  handleAudio(data) {
+    this.core.audioLevel = data.audioLevel;
+    this.el.audioBar.style.width = Math.min(100, data.audioLevel * 500) + '%';
+  }
+
+  triggerListen() {
+    this.el.talkBtn.style.opacity = '0.6';
+    fetch('/api/listen', { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        this.el.talkBtn.style.opacity = '1';
+      })
+      .catch(err => {
+        console.error('Listen trigger failed:', err);
+        this.el.talkBtn.style.opacity = '1';
+      });
+  }
+
+  toggleNote(id) {
+    fetch(`/api/notes/${id}/toggle`, { method: 'POST' }).catch(e => console.error('Toggle failed:', e));
+  }
+
+  deleteNote(id) {
+    fetch(`/api/notes/${id}`, { method: 'DELETE' }).catch(e => console.error('Delete failed:', e));
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  animate() {
+    const dt = 1 / 60;
+    this.core.update(dt);
+    this.core.render();
+    requestAnimationFrame(() => this.animate());
+  }
+}
+
+// Boot
+let dashboard;
+window.addEventListener('DOMContentLoaded', () => { dashboard = new Dashboard(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+opencv-python-headless>=4.8
+numpy
+anthropic>=0.40.0
+chromadb>=0.4
+faster-whisper>=1.0.0
+openwakeword>=0.6
+pyttsx3
+elevenlabs>=2.0
+python-dotenv
+Pillow
+sounddevice
+scipy
+fastapi>=0.100
+uvicorn[standard]>=0.20
+websockets>=11.0
+ddgs>=9.0
+groq>=0.4.1
