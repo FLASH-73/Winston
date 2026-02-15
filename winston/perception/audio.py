@@ -35,8 +35,19 @@ SILENCE_CHECK_SAMPLES = int(SAMPLE_RATE * 0.5)  # 0.5s chunks for silence detect
 
 
 class AudioListener:
+    """Microphone input, STT, always-listening, and barge-in detection.
+
+    Opens a 16kHz mono audio stream via sounddevice. Runs a processing loop
+    on a background thread that handles three concurrent concerns:
+    1. Always-listening: energy-threshold state machine detects speech onset,
+       accumulates audio, dispatches for STT + intent classification.
+    2. Barge-in: during TTS playback, detects user speech via energy spikes
+       above the TTS echo baseline, then interrupts playback.
+    3. Wake word recording: after manual trigger or wake word, records until
+       silence, then transcribes.
+    """
+
     def __init__(self):
-        self._whisper_model = None
         self._oww_model = None
         self._vad_model = None
         self._stream: Optional[sd.InputStream] = None
@@ -60,8 +71,9 @@ class AudioListener:
         self._bargein_cooldown_until = 0.0  # Suppress barge-in after false positives
 
         # Energy-delta barge-in detector (replaces Silero VAD during TTS)
+        from config import BARGEIN_CONSECUTIVE_FRAMES, BARGEIN_ENERGY_THRESHOLD, BARGEIN_THRESHOLD_FACTOR
         from utils.echo_cancel import EnergyBargeInDetector
-        from config import BARGEIN_ENERGY_THRESHOLD, BARGEIN_THRESHOLD_FACTOR, BARGEIN_CONSECUTIVE_FRAMES
+
         self._energy_detector = EnergyBargeInDetector(
             threshold_factor=BARGEIN_THRESHOLD_FACTOR,
             consecutive_trigger=BARGEIN_CONSECUTIVE_FRAMES,
@@ -92,26 +104,28 @@ class AudioListener:
         self._al_last_tts_stop_time = 0.0
         self._on_ambient_transcription: Optional[Callable[[str], None]] = None
 
-        # STT provider state (initialized in start())
-        self._stt_provider = "local"  # "groq" or "local"
-        self._groq_client = None
-        self._groq_whisper_model = None
+        # STT provider (initialized in start())
+        self._stt_provider = None  # STTProvider instance
 
         # Import-time config
-        from config import WHISPER_MODEL, SILENCE_THRESHOLD, LISTEN_TIMEOUT
-        from config import BARGEIN_ENABLED
-        from config import NOISE_REDUCE_ENABLED, MIN_AUDIO_DURATION
         from config import (
-            ALWAYS_LISTEN_ENABLED, ALWAYS_LISTEN_ENERGY_THRESHOLD,
-            ALWAYS_LISTEN_SILENCE_DURATION, ALWAYS_LISTEN_TIMEOUT,
-            ALWAYS_LISTEN_MIN_SPEECH_DURATION, ALWAYS_LISTEN_COOLDOWN_AFTER_TTS,
-            ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE, ALWAYS_LISTEN_STORE_REJECTED,
+            ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE,
+            ALWAYS_LISTEN_COOLDOWN_AFTER_TTS,
+            ALWAYS_LISTEN_ENABLED,
+            ALWAYS_LISTEN_ENERGY_THRESHOLD,
+            ALWAYS_LISTEN_MIN_SPEECH_DURATION,
+            ALWAYS_LISTEN_SILENCE_DURATION,
+            ALWAYS_LISTEN_STORE_REJECTED,
+            ALWAYS_LISTEN_TIMEOUT,
+            BARGEIN_ENABLED,
+            LISTEN_TIMEOUT,
+            MIN_AUDIO_DURATION,
+            SILENCE_THRESHOLD,
         )
-        self._whisper_model_name = WHISPER_MODEL
+
         self._silence_threshold = SILENCE_THRESHOLD
         self._listen_timeout = LISTEN_TIMEOUT
         self._bargein_enabled = BARGEIN_ENABLED
-        self._noise_reduce_enabled = NOISE_REDUCE_ENABLED
         self._min_audio_duration = MIN_AUDIO_DURATION
         self._al_config_enabled = ALWAYS_LISTEN_ENABLED
         self._al_energy_threshold = ALWAYS_LISTEN_ENERGY_THRESHOLD
@@ -125,33 +139,13 @@ class AudioListener:
     def start(self) -> bool:
         """Initialize STT provider, defer OWW to background, open audio stream."""
         # 1. Initialize STT provider
-        from config import STT_PROVIDER
-        if STT_PROVIDER == "groq":
-            try:
-                from groq import Groq
-                from config import GROQ_API_KEY, GROQ_WHISPER_MODEL
-                self._groq_client = Groq(api_key=GROQ_API_KEY)
-                self._groq_whisper_model = GROQ_WHISPER_MODEL
-                self._stt_provider = "groq"
-                logger.info("STT: Groq API (model: %s)", GROQ_WHISPER_MODEL)
-            except Exception as e:
-                logger.error("Failed to initialize Groq STT: %s. Falling back to local.", e)
-                STT_PROVIDER = "local"
+        from perception.stt import create_stt_provider
 
-        if STT_PROVIDER != "groq":
-            try:
-                from faster_whisper import WhisperModel
-                logger.info("Loading Whisper model (%s) via faster-whisper...", self._whisper_model_name)
-                self._whisper_model = WhisperModel(
-                    self._whisper_model_name,
-                    device="cpu",
-                    compute_type="int8",
-                )
-                self._stt_provider = "local"
-                logger.info("Whisper model loaded (faster-whisper, int8)")
-            except Exception as e:
-                logger.error("Failed to load Whisper model: %s", e)
-                return False
+        try:
+            self._stt_provider = create_stt_provider()
+        except Exception as e:
+            logger.error("Failed to initialize STT provider: %s", e)
+            return False
 
         # 2. Open audio stream
         try:
@@ -192,11 +186,12 @@ class AudioListener:
             if not any(os.path.exists(p) for p in model_paths):
                 logger.info("Downloading openwakeword models (first time)...")
                 from openwakeword.utils import download_models
+
                 download_models()
 
             logger.info("Loading wake word model...")
             self._oww_model = OWWModel(
-                wakeword_models=["hey_jarvis"],
+                wakeword_models=["hey_jarvis"],  # openwakeword pre-trained model (not customizable)
                 inference_framework="onnx",
             )
             logger.info("Wake word model loaded")
@@ -205,6 +200,7 @@ class AudioListener:
             if self._bargein_enabled:
                 try:
                     from openwakeword.vad import VAD as SileroVAD
+
                     self._vad_model = SileroVAD()
                     logger.info("Silero VAD loaded for barge-in detection (ONNX)")
                 except Exception as e:
@@ -289,7 +285,7 @@ class AudioListener:
         if self._al_state == "accumulating":
             self._al_buffer.append(chunk)
         # Publish audio level for dashboard
-        self._current_audio_level = float(np.sqrt(np.mean(chunk ** 2)))
+        self._current_audio_level = float(np.sqrt(np.mean(chunk**2)))
 
     def _processing_loop(self):
         """Main processing loop running in background thread."""
@@ -318,11 +314,13 @@ class AudioListener:
                 oww_buffer = oww_buffer[CHUNK_SAMPLES:]
 
                 # Barge-in detection during TTS playback
-                if (self._bargein_enabled
-                        and not self._is_listening
-                        and self._tts_is_speaking is not None
-                        and self._tts_is_speaking()
-                        and time.monotonic() >= self._bargein_cooldown_until):
+                if (
+                    self._bargein_enabled
+                    and not self._is_listening
+                    and self._tts_is_speaking is not None
+                    and self._tts_is_speaking()
+                    and time.monotonic() >= self._bargein_cooldown_until
+                ):
                     self._check_bargein(frame)
 
                 # Always-listen: detect ambient speech (non-blocking)
@@ -384,7 +382,7 @@ class AudioListener:
             if now - last_check >= 0.5 and self._listen_buffer:
                 last_check = now
                 # Check the last 0.5s of audio
-                recent = self._listen_buffer[-int(SAMPLE_RATE * 0.5 / CHUNK_SAMPLES):]
+                recent = self._listen_buffer[-int(SAMPLE_RATE * 0.5 / CHUNK_SAMPLES) :]
                 if recent:
                     recent_audio = np.concatenate(recent)
                     if self._detect_silence(recent_audio):
@@ -404,14 +402,15 @@ class AudioListener:
 
             # Skip if very short (probably just noise after wake word)
             if len(audio) < SAMPLE_RATE * self._min_audio_duration:
-                logger.info("Audio too short (%.2fs), skipping transcription",
-                            len(audio) / SAMPLE_RATE)
+                logger.info("Audio too short (%.2fs), skipping transcription", len(audio) / SAMPLE_RATE)
                 if is_bargein:
                     self._bargein_cooldown_until = time.monotonic() + 3.0
                     logger.info("Barge-in false positive (short audio) — cooldown 3s")
                 return
 
-            text, lang = self._transcribe(audio)
+            result = self._stt_provider.transcribe(audio)
+            text = result.text if result else ""
+            lang = result.language if result else "en"
 
             # Barge-in false positive detection: if we got no speech, suppress
             # further barge-in for a cooldown period to break infinite loops.
@@ -423,7 +422,8 @@ class AudioListener:
             if text and self._on_transcription:
                 # Echo text handling: strip TTS prefix from transcription
                 if self._get_last_tts_text is not None:
-                    from utils.echo_cancel import strip_echo_prefix, echo_text_overlap
+                    from utils.echo_cancel import echo_text_overlap, strip_echo_prefix
+
                     last_tts = self._get_last_tts_text()
                     if last_tts:
                         # First try prefix stripping ("Yes, how are you?" -> "how are you?")
@@ -440,7 +440,8 @@ class AudioListener:
                             if overlap > 0.6:
                                 logger.info(
                                     "Echo rejected (%.0f%% overlap with TTS): '%s'",
-                                    overlap * 100, text,
+                                    overlap * 100,
+                                    text,
                                 )
                                 return
 
@@ -464,78 +465,6 @@ class AudioListener:
         rms = np.sqrt(np.mean(audio_chunk**2)) * 32768  # Convert float32 to int16 scale
         return rms < self._silence_threshold
 
-    def _transcribe(self, audio: np.ndarray) -> tuple[str, str]:
-        """Transcribe audio. Routes to Groq API or local faster-whisper."""
-        if self._stt_provider == "groq":
-            return self._transcribe_groq(audio)
-        return self._transcribe_local(audio)
-
-    def _transcribe_groq(self, audio: np.ndarray) -> tuple[str, str]:
-        """Transcribe via Groq Whisper API. Returns (text, detected_language_code)."""
-        import io
-        import struct
-
-        try:
-            # Convert float32 numpy → 16-bit PCM WAV bytes
-            pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
-            buf = io.BytesIO()
-            # Write WAV header (44 bytes) for 16kHz mono 16-bit PCM
-            data_size = len(pcm) * 2  # 2 bytes per int16 sample
-            buf.write(b"RIFF")
-            buf.write(struct.pack("<I", 36 + data_size))
-            buf.write(b"WAVE")
-            buf.write(b"fmt ")
-            buf.write(struct.pack("<I", 16))       # fmt chunk size
-            buf.write(struct.pack("<H", 1))        # PCM format
-            buf.write(struct.pack("<H", 1))        # mono
-            buf.write(struct.pack("<I", SAMPLE_RATE))
-            buf.write(struct.pack("<I", SAMPLE_RATE * 2))  # byte rate
-            buf.write(struct.pack("<H", 2))        # block align
-            buf.write(struct.pack("<H", 16))       # bits per sample
-            buf.write(b"data")
-            buf.write(struct.pack("<I", data_size))
-            buf.write(pcm.tobytes())
-            buf.seek(0)
-
-            response = self._groq_client.audio.transcriptions.create(
-                file=("audio.wav", buf.read()),
-                model=self._groq_whisper_model,
-                response_format="verbose_json",
-                prompt="Winston, workshop assistant. Bilingual: English and German.",
-            )
-            text = response.text.strip() if response.text else ""
-            lang = getattr(response, "language", "en") or "en"
-            logger.info("Transcription [%s] (groq): %s", lang, text)
-            return text, lang
-        except Exception as e:
-            logger.error("Groq transcription failed: %s", e)
-            return "", "en"
-
-    def _transcribe_local(self, audio: np.ndarray) -> tuple[str, str]:
-        """Transcribe via local faster-whisper. Returns (text, detected_language_code)."""
-        try:
-            if self._noise_reduce_enabled:
-                try:
-                    import noisereduce as nr
-                    audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE)
-                except ImportError:
-                    pass
-
-            segments, info = self._whisper_model.transcribe(
-                audio,
-                beam_size=5,
-                language=None,
-                vad_filter=True,
-                initial_prompt="Winston, workshop assistant. Bilingual: English and German.",
-            )
-            text = " ".join(seg.text for seg in segments).strip()
-            lang = info.language if info else "en"
-            logger.info("Transcription [%s] (local): %s", lang, text)
-            return text, lang
-        except Exception as e:
-            logger.error("Transcription failed: %s", e)
-            return "", "en"
-
     # ── Always-listen state machine ───────────────────────────────────
 
     def _al_process_frame(self, frame: np.ndarray) -> None:
@@ -558,13 +487,15 @@ class AudioListener:
                 self._al_state = "idle"
             return
 
-        energy = float(np.sqrt(np.mean(frame ** 2)))
+        energy = float(np.sqrt(np.mean(frame**2)))
 
         if self._al_state == "idle":
             if energy >= self._al_energy_threshold:
                 # Post-TTS cooldown: don't start accumulating too soon after TTS
-                if (self._al_last_tts_stop_time > 0 and
-                        (time.monotonic() - self._al_last_tts_stop_time) < self._al_cooldown_after_tts):
+                if (
+                    self._al_last_tts_stop_time > 0
+                    and (time.monotonic() - self._al_last_tts_stop_time) < self._al_cooldown_after_tts
+                ):
                     return
                 # Concurrent thread limit
                 with self._al_active_threads_lock:
@@ -594,8 +525,7 @@ class AudioListener:
                 if energy < self._al_energy_threshold:
                     self._al_silence_counter += 0.3
                     if self._al_silence_counter >= self._al_silence_duration:
-                        logger.info("Always-listen: silence after %.1fs, dispatching",
-                                    elapsed)
+                        logger.info("Always-listen: silence after %.1fs, dispatching", elapsed)
                         self._al_dispatch()
                 else:
                     self._al_silence_counter = 0.0
@@ -605,6 +535,15 @@ class AudioListener:
 
         Non-blocking: spawns a daemon thread. Sets state to cooldown.
         """
+        import uuid
+
+        from utils.latency_tracker import LatencyTracker
+
+        interaction_id = str(uuid.uuid4())
+        tracker = LatencyTracker.get()
+        tracker.begin(interaction_id)
+        tracker.mark(interaction_id, "speech_end")
+
         audio_chunks = self._al_buffer
         self._al_buffer = []
         self._al_state = "cooldown"
@@ -612,6 +551,7 @@ class AudioListener:
 
         if not audio_chunks:
             self._al_state = "idle"
+            tracker.discard(interaction_id)
             return
 
         audio = np.concatenate(audio_chunks)
@@ -620,6 +560,7 @@ class AudioListener:
         if duration < self._al_min_speech_duration:
             logger.debug("Always-listen: too short (%.2fs), skipping", duration)
             self._al_state = "idle"
+            tracker.discard(interaction_id)
             return
 
         with self._al_active_threads_lock:
@@ -627,50 +568,83 @@ class AudioListener:
 
         threading.Thread(
             target=self._al_transcribe_and_classify,
-            args=(audio,),
+            args=(audio, interaction_id),
             daemon=True,
             name="al-transcribe",
         ).start()
 
-    def _al_transcribe_and_classify(self, audio: np.ndarray) -> None:
+    def _al_transcribe_and_classify(self, audio: np.ndarray, interaction_id: str = None) -> None:
         """Background thread: transcribe audio, apply echo rejection, fire callback."""
         try:
             # Pre-check: skip Whisper if average energy is too low (mostly silence)
-            avg_energy = float(np.sqrt(np.mean(audio ** 2)))
+            avg_energy = float(np.sqrt(np.mean(audio**2)))
             if avg_energy < self._al_energy_threshold * 0.5:
-                logger.debug("Always-listen: skipping transcription (avg energy %.4f < %.4f)",
-                            avg_energy, self._al_energy_threshold * 0.5)
+                logger.debug(
+                    "Always-listen: skipping transcription (avg energy %.4f < %.4f)",
+                    avg_energy,
+                    self._al_energy_threshold * 0.5,
+                )
+                if interaction_id:
+                    from utils.latency_tracker import LatencyTracker
+
+                    LatencyTracker.get().discard(interaction_id)
                 return
 
-            text, lang = self._transcribe(audio)
+            result = self._stt_provider.transcribe(audio)
+            text = result.text if result else ""
+            lang = result.language if result else "en"
+
+            # Mark STT completion and log latency
+            if interaction_id:
+                from utils.latency_tracker import LatencyTracker
+
+                tracker = LatencyTracker.get()
+                tracker.mark(interaction_id, "stt_done")
+                stt_ms = tracker._active.get(interaction_id)
+                if stt_ms:
+                    delta = stt_ms.elapsed("speech_end", "stt_done")
+                    if delta is not None:
+                        logger.info("[latency] STT: %dms", delta)
+
             if not text or not text.strip():
+                if interaction_id:
+                    LatencyTracker.get().discard(interaction_id)
                 return
 
             # Filter known Whisper hallucinations (phantom phrases on near-silent audio)
             if text.strip().lower().rstrip(".!?,") in WHISPER_HALLUCINATIONS:
                 logger.info("Always-listen: filtered Whisper hallucination: '%s'", text)
+                if interaction_id:
+                    LatencyTracker.get().discard(interaction_id)
                 return
 
             # Filter prompt leaks: Whisper echoes its prompt on ambiguous audio
             import re
-            text_words = set(re.sub(r'[^\w\s]', '', text.lower()).split())
+
+            text_words = set(re.sub(r"[^\w\s]", "", text.lower()).split())
             if text_words and text_words.issubset(WHISPER_PROMPT_WORDS):
                 logger.info("Always-listen: filtered prompt leak: '%s'", text)
+                if interaction_id:
+                    LatencyTracker.get().discard(interaction_id)
                 return
 
             # Echo rejection: check for TTS echo contamination
             if self._get_last_tts_text is not None:
-                from utils.echo_cancel import strip_echo_prefix, echo_text_overlap
+                from utils.echo_cancel import echo_text_overlap, strip_echo_prefix
+
                 last_tts = self._get_last_tts_text()
                 if last_tts:
                     overlap = echo_text_overlap(text, last_tts)
                     if overlap > 0.6:
-                        logger.info("Always-listen: echo rejected (%.0f%% overlap): '%s'",
-                                    overlap * 100, text)
+                        logger.info("Always-listen: echo rejected (%.0f%% overlap): '%s'", overlap * 100, text)
+                        if interaction_id:
+                            LatencyTracker.get().discard(interaction_id)
                         return
                     cleaned = strip_echo_prefix(text, last_tts)
                     if not cleaned:
                         logger.info("Always-listen: echo rejected (all prefix): '%s'", text)
+                        if interaction_id:
+                            LatencyTracker.get().discard(interaction_id)
                         return
                     if cleaned != text:
                         text = cleaned
@@ -679,18 +653,26 @@ class AudioListener:
 
             # Fire ambient callback for intent classification in main.py
             if self._on_ambient_transcription:
-                self._on_ambient_transcription(text, lang)
+                self._on_ambient_transcription(text, lang, interaction_id)
             elif self._on_transcription:
                 # Fallback: route directly if no ambient callback
                 threading.Thread(
                     target=self._on_transcription,
                     args=(text, lang),
+                    kwargs={"interaction_id": interaction_id},
                     daemon=True,
                     name="transcription-handler",
                 ).start()
 
         except Exception as e:
             logger.error("Always-listen error: %s", e, exc_info=True)
+            if interaction_id:
+                try:
+                    from utils.latency_tracker import LatencyTracker
+
+                    LatencyTracker.get().discard(interaction_id)
+                except Exception:
+                    pass
         finally:
             with self._al_active_threads_lock:
                 self._al_active_threads = max(0, self._al_active_threads - 1)
@@ -719,10 +701,12 @@ class AudioListener:
 
     @property
     def always_listen_active(self) -> bool:
+        """Whether always-listening is enabled and receptive (idle or accumulating)."""
         return self._always_listen_enabled and self._al_state in ("idle", "accumulating")
 
     @property
     def always_listen_state(self) -> str:
+        """Current state machine label: disabled/idle/accumulating/cooldown."""
         return self._al_state
 
     def stop(self):

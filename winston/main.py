@@ -22,14 +22,15 @@ deferred to start() so python main.py shows output instantly.
 """
 
 import logging
+import os
 import signal
 import sys
-import time
 import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging EARLY so import progress is visible
 logging.basicConfig(
@@ -39,6 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("winston")
 
+
 # Catch unhandled exceptions in daemon threads so they don't die silently
 def _daemon_thread_exception_hook(args):
     logger.error(
@@ -47,6 +49,7 @@ def _daemon_thread_exception_hook(args):
         args.exc_value,
         exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
     )
+
 
 threading.excepthook = _daemon_thread_exception_hook
 
@@ -73,7 +76,7 @@ class Winston:
         # Abort event for canceling Claude streaming on barge-in
         self._streaming_abort = threading.Event()
         # Guard against concurrent agent tasks (rate limit protection)
-        self._agent_running = False
+        self._agent_lock = threading.Lock()
         # Persistent stores (initialized in start())
         self._agent_store = None
         self._notes_store = None
@@ -88,10 +91,15 @@ class Winston:
         self._log_step("Starting dashboard")
         t = time.time()
         from dashboard.server import (
-            create_app, start_server, set_audio,
-            set_camera, set_memory, set_cost_tracker,
+            create_app,
+            set_audio,
+            set_camera,
+            set_cost_tracker,
+            set_memory,
             set_notes_store,
+            start_server,
         )
+
         logger.info("  dashboard module loaded (%.1fs)", time.time() - t)
         dashboard_app = create_app(self.state, None)
         start_server(dashboard_app, port=8420)
@@ -100,8 +108,9 @@ class Winston:
         # ── 1. Camera (imports cv2) ───────────────────────────────────
         self._log_step("Initializing camera")
         t = time.time()
-        from perception.camera import Camera
         from config import CAMERA_SOURCE
+        from perception.camera import Camera
+
         logger.info("  camera module loaded (%.1fs)", time.time() - t)
         self.camera = Camera()
         self.state.set_module_status("camera", "loading")
@@ -117,6 +126,7 @@ class Winston:
         self._log_step("Loading speech recognition")
         t = time.time()
         from perception.audio import AudioListener
+
         logger.info("  audio module loaded (%.1fs)", time.time() - t)
         self.audio = AudioListener()
         self.state.set_module_status("audio", "loading")
@@ -138,10 +148,11 @@ class Winston:
         # ── 3. Memory + TTS + Claude (imports anthropic, chromadb) ──
         self._log_step("Initializing Memory, TTS, and Claude in parallel")
         t = time.time()
-        from perception.tts import TTSEngine
         from brain.claude_client import ClaudeClient
         from brain.memory import Memory
+        from perception.tts import TTSEngine
         from utils.cost_tracker import CostTracker
+
         logger.info("  brain modules loaded (%.1fs)", time.time() - t)
 
         self.cost_tracker = CostTracker()
@@ -220,12 +231,11 @@ class Winston:
 
         # ── 4. Proactive engine (imports cv2 again — cached, instant) ─
         from brain.proactive import ProactiveEngine
+
         self.proactive = ProactiveEngine(self.camera, self.llm, self.memory, self.tts)
 
         # Background tasks
-        threading.Thread(
-            target=self._consolidate_memory, daemon=True, name="memory-consolidate"
-        ).start()
+        threading.Thread(target=self._consolidate_memory, daemon=True, name="memory-consolidate").start()
 
         # Quick end-to-end test: verify Claude chat returns text
         try:
@@ -247,10 +257,11 @@ class Winston:
         self.state.set_status("idle")
         facts_count = self.memory.semantic.fact_count
         self._log_banner(
-            f"System online. Memory: {self.memory.entry_count} episodes, "
-            f"{facts_count} facts. Mode: always-listening."
+            f"System online. Memory: {self.memory.entry_count} episodes, {facts_count} facts. Mode: always-listening."
         )
-        self.tts.speak_async("I'm online. I can see your workshop.")
+        from personality import get_catchphrase
+
+        self.tts.speak_async(get_catchphrase("greeting", "en"))
 
         return True
 
@@ -265,7 +276,7 @@ class Winston:
 
             try:
                 # Update audio level for dashboard
-                if hasattr(self.audio, '_current_audio_level'):
+                if hasattr(self.audio, "_current_audio_level"):
                     self.state.set_audio_level(self.audio._current_audio_level)
 
                 # Update always-listen state for dashboard
@@ -306,6 +317,15 @@ class Winston:
                 # 4. Budget check
                 if not self.cost_tracker.check_budget():
                     self._enter_low_budget_mode()
+
+                # 5. Update latency stats for dashboard
+                from utils.latency_tracker import LatencyTracker
+
+                lat_tracker = LatencyTracker.get()
+                lat_stats = lat_tracker.get_stats()
+                if lat_stats.get("interaction_count", 0) > 0:
+                    self.state.set_latency_stats(lat_stats)
+                lat_tracker.cleanup_stale()
 
             except Exception as e:
                 logger.error("Main loop error: %s", e, exc_info=True)
@@ -350,19 +370,24 @@ class Winston:
         self._streaming_abort.set()
         self.tts.interrupt()
 
-    def _on_transcription(self, text: str, lang: str = "en", model: str = None):
+    def _on_transcription(self, text: str, lang: str = "en", model: str = None, interaction_id: str = None):
         """Called when user speech is transcribed. Runs in a daemon thread.
 
         Uses Claude Haiku with tool-use routing: Haiku decides whether to answer
         directly, delegate to the agent, save a note, or shut down.
         No keyword matching — end-to-end intelligence.
         """
+        from utils.latency_tracker import LatencyTracker
+
+        tracker = LatencyTracker.get()
+
         try:
             logger.info("[transcription] User said [%s]: '%s'", lang, text)
 
             if not text.strip():
                 logger.info("[transcription] Empty text, ignoring")
                 self.state.set_status("idle")
+                tracker.discard(interaction_id)
                 return
 
             self.state.set_status("thinking")
@@ -371,9 +396,7 @@ class Winston:
             t0 = time.time()
             with ThreadPoolExecutor(max_workers=2) as executor:
                 frame_future = executor.submit(self.camera.get_frame_bytes)
-                context_future = executor.submit(
-                    self.memory.assemble_context, query=text, purpose="conversation"
-                )
+                context_future = executor.submit(self.memory.assemble_context, query=text, purpose="conversation")
                 frame_bytes = frame_future.result(timeout=5)
                 context = context_future.result(timeout=5)
             # Inject recent agent result so Haiku knows about follow-ups
@@ -388,11 +411,14 @@ class Winston:
             # Inject last user utterance for speech continuations
             if self._last_user_utterance:
                 context = (context or "") + (
-                    f"\n\n[Previous speech fragment from Roberto (moments ago)]\n"
-                    f"\"{self._last_user_utterance}\""
+                    f'\n\n[Previous speech fragment from Roberto (moments ago)]\n"{self._last_user_utterance}"'
                 )
 
             logger.info("[transcription] Frame + context ready (%.1fms)", (time.time() - t0) * 1000)
+
+            # Mark context ready for latency tracking
+            if interaction_id:
+                tracker.mark(interaction_id, "context_ready")
 
             # Build conversation history for multi-turn context
             conversation_history = self._build_conversation_history()
@@ -406,22 +432,32 @@ class Winston:
                 language=lang,
                 conversation_history=conversation_history,
             )
-            logger.info("[transcription] Routed to '%s' (%.0fms)", action, (time.time() - t0) * 1000)
+            routing_ms = (time.time() - t0) * 1000
+            logger.info("[transcription] Routed to '%s' (%.0fms)", action, routing_ms)
+
+            # Mark LLM done for latency tracking
+            if interaction_id:
+                tracker.mark(interaction_id, "llm_done")
 
             if action == "shutdown":
                 logger.info("[transcription] Shutdown command: '%s'", text)
-                msg = "Gehe offline. Tschüss." if lang == "de" else "Going offline. Goodbye."
+                from personality import get_catchphrase
+
+                msg = get_catchphrase("farewell", lang)
                 self.state.set_status("speaking")
+                tracker.finish(interaction_id)
                 self.tts.speak(msg)
                 self._running = False
                 return
 
             if action == "agent":
                 self._spawn_agent_task(data.get("task", text), lang)
+                tracker.finish(interaction_id)
                 return
 
             if action == "note":
                 self._handle_note_from_intent(data.get("content", text), lang)
+                tracker.finish(interaction_id)
                 return
 
             # Conversation — Haiku already generated the response
@@ -432,7 +468,7 @@ class Winston:
                 self.state.add_conversation("user", text)
                 self.state.add_conversation("winston", response)
                 self.state.set_status("speaking")
-                self.tts.speak_async(response)
+                self.tts.speak_async(response, interaction_id=interaction_id)
 
                 conversation_text = f"Q: {text}\nA: {response}"
                 self.memory.store(conversation_text, entry_type="conversation")
@@ -448,18 +484,24 @@ class Winston:
                         name="fact-extraction",
                     ).start()
             else:
-                self.tts.speak_async("Sorry, I couldn't process that. Try again?")
+                from personality import get_catchphrase
+
+                self.tts.speak_async(get_catchphrase("error_process", "en"))
                 self.state.set_status("idle")
+                tracker.discard(interaction_id)
 
         except Exception as e:
             logger.error("[transcription] Error: %s", e, exc_info=True)
+            tracker.discard(interaction_id)
             try:
-                self.tts.speak_async("Sorry, something went wrong. Try again?")
+                from personality import get_catchphrase
+
+                self.tts.speak_async(get_catchphrase("error_generic", "en"))
             except Exception:
                 pass
             self.state.set_status("idle")
 
-    def _on_ambient_transcription(self, text: str, lang: str = "en") -> None:
+    def _on_ambient_transcription(self, text: str, lang: str = "en", interaction_id: str = None) -> None:
         """Called when always-listening detects speech.
 
         Uses local heuristic to decide if speech is addressed to Winston.
@@ -467,8 +509,13 @@ class Winston:
         Supports continuations: if a recent fragment was addressed to Winston,
         subsequent fragments within the continuation window skip intent classification.
         """
+        from utils.latency_tracker import LatencyTracker
+
+        tracker = LatencyTracker.get()
+
         try:
             if not text.strip():
+                tracker.discard(interaction_id)
                 return
 
             logger.info("[ambient] Heard [%s]: '%s'", lang, text)
@@ -476,11 +523,16 @@ class Winston:
             # ━━━━ CONTINUATION CHECK ━━━━
             # If a recent fragment was addressed to Winston, treat this as continuation
             from config import ALWAYS_LISTEN_CONTINUATION_WINDOW
+
             if (time.monotonic() - self._last_addressed_time) < ALWAYS_LISTEN_CONTINUATION_WINDOW:
-                logger.info("[ambient] Intent: continuation (%.1fs since last addressed)",
-                            time.monotonic() - self._last_addressed_time)
+                logger.info(
+                    "[ambient] Intent: continuation (%.1fs since last addressed)",
+                    time.monotonic() - self._last_addressed_time,
+                )
                 self._last_addressed_time = time.monotonic()
-                self._on_transcription(text, lang)
+                if interaction_id:
+                    tracker.mark(interaction_id, "intent_done")
+                self._on_transcription(text, lang, interaction_id=interaction_id)
                 return
 
             # ━━━━ NORMAL CLASSIFICATION ━━━━
@@ -492,18 +544,20 @@ class Winston:
 
             if local_result is True:
                 source = "conversational context" if recently_spoke else "local"
-                logger.info("[ambient] Intent: for Winston (%s, %.0fms)",
-                            source, (time.time() - t0) * 1000)
+                logger.info("[ambient] Intent: for Winston (%s, %.0fms)", source, (time.time() - t0) * 1000)
                 self._last_addressed_time = time.monotonic()
-                self._on_transcription(text, lang)
+                if interaction_id:
+                    tracker.mark(interaction_id, "intent_done")
+                self._on_transcription(text, lang, interaction_id=interaction_id)
 
             elif local_result is False:
-                logger.info("[ambient] Intent: not for Winston (local, %.0fms)",
-                            (time.time() - t0) * 1000)
+                logger.info("[ambient] Intent: not for Winston (local, %.0fms)", (time.time() - t0) * 1000)
+                tracker.discard(interaction_id)
                 from config import ALWAYS_LISTEN_STORE_REJECTED
+
                 if ALWAYS_LISTEN_STORE_REJECTED:
                     self.memory.store(
-                        f"[Ambient] Roberto said (not to Winston): \"{text}\"",
+                        f'[Ambient] Roberto said (not to Winston): "{text}"',
                         entry_type="observation",
                         activity="ambient speech",
                     )
@@ -512,24 +566,31 @@ class Winston:
                 # Ambiguous — single API call to check if addressed
                 t0 = time.time()
                 is_addressed = self.llm.classify_intent(text)
-                logger.info("[ambient] Intent: %s (API, %.0fms)",
-                            "for Winston" if is_addressed else "not for Winston",
-                            (time.time() - t0) * 1000)
+                logger.info(
+                    "[ambient] Intent: %s (API, %.0fms)",
+                    "for Winston" if is_addressed else "not for Winston",
+                    (time.time() - t0) * 1000,
+                )
 
                 if is_addressed:
                     self._last_addressed_time = time.monotonic()
-                    self._on_transcription(text, lang)
+                    if interaction_id:
+                        tracker.mark(interaction_id, "intent_done")
+                    self._on_transcription(text, lang, interaction_id=interaction_id)
                 else:
+                    tracker.discard(interaction_id)
                     from config import ALWAYS_LISTEN_STORE_REJECTED
+
                     if ALWAYS_LISTEN_STORE_REJECTED:
                         self.memory.store(
-                            f"[Ambient] Roberto said (not to Winston): \"{text}\"",
+                            f'[Ambient] Roberto said (not to Winston): "{text}"',
                             entry_type="observation",
                             activity="ambient speech",
                         )
 
         except Exception as e:
             logger.error("[ambient] Error: %s", e, exc_info=True)
+            tracker.discard(interaction_id)
 
     def _get_recent_agent_result(self, max_age_seconds: float = 300) -> Optional[dict]:
         """Get the most recent completed agent task within max_age_seconds.
@@ -554,19 +615,20 @@ class Winston:
 
     def _spawn_agent_task(self, text: str, lang: str = "en"):
         """Spawn a background agent to investigate a code problem."""
-        if self._agent_running:
-            msg = ("Ich arbeite noch an der vorherigen Aufgabe."
-                   if lang == "de" else "I'm still working on the previous task.")
+        if not self._agent_lock.acquire(blocking=False):
+            from personality import get_catchphrase
+
+            msg = get_catchphrase("agent_busy", lang)
             self.tts.speak_async(msg)
             return
-        self._agent_running = True
         task_id = str(uuid.uuid4())
         logger.info("[agent] Spawning agent task %s: '%s'", task_id[:8], text)
 
         self.state.add_conversation("user", text)
         self.state.set_status("speaking")
-        msg = ("Ich schaue mir das an. Ich melde mich." if lang == "de"
-               else "Let me investigate that. I'll let you know what I find.")
+        from personality import get_catchphrase
+
+        msg = get_catchphrase("agent_starting", lang)
         self.tts.speak_async(msg)
 
         # Persist task to disk (survives crashes)
@@ -601,23 +663,26 @@ class Winston:
 
     def _run_agent_task(self, task_id: str, task: str, context: str = None):
         """Background thread: run agent with Computer Use and speak findings."""
-        try:  # noqa: outer try for _agent_running reset
+        try:  # outer try for _agent_lock release
             from brain.agent_executor import AgentExecutor
             from brain.agent_tools import create_default_registry
-            from config import COMPUTER_USE_ENABLED, COMPUTER_USE_DISPLAY_WIDTH, COMPUTER_USE_DISPLAY_HEIGHT
+            from config import COMPUTER_USE_DISPLAY_HEIGHT, COMPUTER_USE_DISPLAY_WIDTH, COMPUTER_USE_ENABLED
 
             registry = create_default_registry()
 
             computer = None
             if COMPUTER_USE_ENABLED:
                 from brain.computer_use import MacOSComputerController
+
                 computer = MacOSComputerController(
                     display_width=COMPUTER_USE_DISPLAY_WIDTH,
                     display_height=COMPUTER_USE_DISPLAY_HEIGHT,
                 )
 
             executor = AgentExecutor(
-                self.llm.client, self.cost_tracker, registry,
+                self.llm.client,
+                self.cost_tracker,
+                registry,
                 computer_controller=computer,
             )
 
@@ -629,12 +694,16 @@ class Winston:
 
             if findings:
                 # Persist result
-                self._agent_store.update_in_list("tasks", task_id, {
-                    "status": "completed",
-                    "completed_at": datetime.now().isoformat(),
-                    "result": findings,
-                    "reported": True,
-                })
+                self._agent_store.update_in_list(
+                    "tasks",
+                    task_id,
+                    {
+                        "status": "completed",
+                        "completed_at": datetime.now().isoformat(),
+                        "result": findings,
+                        "reported": True,
+                    },
+                )
                 self.state.update_agent_task(task_id, "completed", findings)
 
                 # Summarize if too long for TTS
@@ -647,7 +716,7 @@ class Winston:
                 else:
                     findings_spoken = findings
 
-                self.state.add_conversation("winston", findings_spoken)
+                self.state.add_conversation("agent", findings_spoken)
                 self.state.set_status("speaking")
                 self.tts.speak_async(findings_spoken)
                 self.memory.store(
@@ -656,35 +725,48 @@ class Winston:
                 )
                 self.state.set_cost(self.cost_tracker.get_daily_cost())
             else:
-                self._agent_store.update_in_list("tasks", task_id, {
-                    "status": "completed",
-                    "completed_at": datetime.now().isoformat(),
-                    "result": "No conclusive findings.",
-                    "reported": True,
-                })
+                self._agent_store.update_in_list(
+                    "tasks",
+                    task_id,
+                    {
+                        "status": "completed",
+                        "completed_at": datetime.now().isoformat(),
+                        "result": "No conclusive findings.",
+                        "reported": True,
+                    },
+                )
                 self.state.update_agent_task(task_id, "completed", "No conclusive findings.")
                 self.state.set_status("speaking")
-                self.tts.speak_async("I couldn't find anything conclusive. Can you give me more details?")
+                from personality import get_catchphrase
+
+                self.tts.speak_async(get_catchphrase("agent_no_findings", "en"))
 
         except Exception as e:
             logger.error("[agent] Task failed: %s", e, exc_info=True)
-            self._agent_store.update_in_list("tasks", task_id, {
-                "status": "failed",
-                "completed_at": datetime.now().isoformat(),
-                "result": f"Error: {e}",
-                "reported": True,
-            })
+            self._agent_store.update_in_list(
+                "tasks",
+                task_id,
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": f"Error: {e}",
+                    "reported": True,
+                },
+            )
             self.state.update_agent_task(task_id, "failed", f"Error: {e}")
             self.state.set_status("speaking")
-            self.tts.speak_async("Sorry, the investigation ran into an error.")
+            from personality import get_catchphrase
+
+            self.tts.speak_async(get_catchphrase("error_investigation", "en"))
         finally:
-            self._agent_running = False
+            self._agent_lock.release()
 
     def _handle_note_from_intent(self, note_text: str, lang: str = "en"):
         """Save note content (already extracted by intent classifier) to persistent store + dashboard."""
+        from personality import get_catchphrase
+
         if not note_text or len(note_text.strip()) < 3:
-            msg = "Was soll ich notieren?" if lang == "de" else "What should I write down?"
-            self.tts.speak_async(msg)
+            self.tts.speak_async(get_catchphrase("note_prompt", lang))
             return
 
         note_text = note_text.strip()
@@ -699,10 +781,10 @@ class Winston:
         self.state.add_note(note)
         logger.info("[notes] Saved note: '%s'", note_text)
         self.state.add_conversation("user", note_text)
-        label = "Notiert" if lang == "de" else "Noted"
+        label = get_catchphrase("note_label", lang)
         self.state.add_conversation("winston", f"{label}: {note_text}")
         self.state.set_status("speaking")
-        confirm = f"Notiert: {note_text}" if lang == "de" else f"Got it. Noted: {note_text}"
+        confirm = get_catchphrase("note_confirm", lang).format(text=note_text)
         self.tts.speak_async(confirm)
         self._last_winston_response_time = time.monotonic()
 
@@ -728,13 +810,20 @@ class Winston:
                 result = task["result"]
                 if len(result) > 500:
                     summary = self.llm.text_only_chat(
-                        f"Summarize briefly: {result}", max_tokens=150,
+                        f"Summarize briefly: {result}",
+                        max_tokens=150,
                     )
                     result = summary or result[:500]
-                self.tts.speak_async(f"From a previous investigation: {result}")
-                self.state.add_conversation("winston", f"[Previous investigation] {result}")
+                from personality import get_catchphrase
+
+                self.tts.speak_async(get_catchphrase("agent_previous", "en").format(result=result))
+                self.state.add_conversation("agent", f"[Previous investigation] {result}")
             elif task["status"] == "failed":
-                self.tts.speak_async(f"A previous investigation was interrupted: {task.get('query', 'unknown task')}")
+                from personality import get_catchphrase
+
+                self.tts.speak_async(
+                    get_catchphrase("agent_interrupted", "en").format(query=task.get("query", "unknown task"))
+                )
             task["reported"] = True
             changed = True
 
@@ -748,7 +837,9 @@ class Winston:
             logger.warning("Daily budget exceeded. Entering low-budget mode.")
             self._capture_interval = 30.0
             self.proactive.update_intervals(60.0)
-            self.tts.speak_async("Budget limit approaching. I'll reduce my observation frequency.")
+            from personality import get_catchphrase
+
+            self.tts.speak_async(get_catchphrase("budget_warning", "en"))
 
     def _shutdown_handler(self, signum, frame):
         """Handle Ctrl+C gracefully. Second Ctrl+C forces immediate exit."""
@@ -764,12 +855,12 @@ class Winston:
         logger.info("Shutting down WINSTON...")
 
         # Non-blocking goodbye
-        self.tts.speak_async("Going offline. Goodbye.")
+        from personality import get_catchphrase
+
+        self.tts.speak_async(get_catchphrase("farewell", "en"))
 
         # Memory session summary with timeout (don't block shutdown)
-        mem_thread = threading.Thread(
-            target=self._safe_shutdown_memory, daemon=True, name="shutdown-memory"
-        )
+        mem_thread = threading.Thread(target=self._safe_shutdown_memory, daemon=True, name="shutdown-memory")
         mem_thread.start()
         mem_thread.join(timeout=3.0)
         if mem_thread.is_alive():
@@ -813,6 +904,22 @@ class Winston:
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Winston Workshop Assistant")
+    parser.add_argument("--personality", "-p", default=None, help="Personality preset name or path to YAML file")
+    args = parser.parse_args()
+
+    # Load personality before anything else — other modules read it via get_personality()
+    from personality import load_personality, set_personality
+
+    personality_name = args.personality or os.getenv("WINSTON_PERSONALITY", "default")
+    try:
+        set_personality(load_personality(personality_name))
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
     winston = Winston()
 
     if not winston.start():

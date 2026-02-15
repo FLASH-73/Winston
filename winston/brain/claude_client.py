@@ -10,7 +10,8 @@ from config import (
     FAST_MODEL,
     SMART_MODEL,
     SYSTEM_PROMPT_PERCEPTION,
-    SYSTEM_PROMPT_CONVERSATION,
+    get_conversation_prompt,
+    get_routing_prompt,
 )
 from utils.cost_tracker import CostTracker
 
@@ -43,8 +44,7 @@ ROUTING_TOOLS = [
     {
         "name": "save_note",
         "description": (
-            "Save a note or reminder when the user asks to remember, write down, "
-            "or note something for later."
+            "Save a note or reminder when the user asks to remember, write down, or note something for later."
         ),
         "input_schema": {
             "type": "object",
@@ -90,63 +90,93 @@ Speech: "{text}"
 
 Answer "yes" or "no" only."""
 
-COMBINED_INTENT_ROUTING_PROMPT = """Is the speaker talking to you (Winston, an AI voice assistant)? If so, does the request need deep analysis?
-They are alone in a robotics workshop. Speech may be in English or German.
-
-Speech: "{text}"
-
-Answer ONLY one of: "yes_fast", "yes_smart", "no"."""
-
-INTENT_CLASSIFICATION_FULL_PROMPT = """Classify the user's intent. They are talking to Winston, an AI workshop assistant. Speech may be in any language.
-
-Speech: "{text}"
-
-Respond with ONLY valid JSON, no markdown:
-{{"intent": "conversation", "note_content": null}}
-
-Possible intents:
-- "shutdown": User wants to stop/quit/shutdown Winston or the system (e.g. "go offline", "shut down", "mach Feierabend", "geh schlafen", "shut up and stop", "goodbye winston")
-- "agent": User wants Winston to autonomously investigate their CODE or GITHUB REPOSITORY in the background (e.g. "check my code for bugs", "look at the repo for issues", "schau dir den Code an", "find the bug in my project"). This is ONLY for code/repository investigation tasks, NOT for general questions, web lookups, or information requests.
-- "note": User wants to save/remember/write down something. Extract ONLY the content to save into "note_content" (e.g. "save this: buy M3 bolts" → note_content="buy M3 bolts", "merk dir ich brauche Schrauben" → note_content="ich brauche Schrauben")
-- "conversation": Everything else — questions, chat, requests, commands, web lookups, time checks, general knowledge, opinions. This is the default. When in doubt, use this."""
-
-# Keywords that trigger the Smart (Sonnet) model
-PRO_TRIGGER_PATTERNS = [
-    "look closely", "inspect", "analyze", "what's wrong",
-    "check this", "debug", "diagnose", "compare",
-    "explain in detail", "zoom in", "carefully",
-    "help me figure out", "what do you think about",
-    "look at this", "examine", "what went wrong",
-]
-
 # Keywords that indicate speech is addressed to Winston (English + German)
 ADDRESSED_KEYWORDS = [
-    "winston", "look at", "help me", "tell me", "show me",
-    "check this", "remember", "what do you think",
-    "can you", "could you", "please",
+    "winston",
+    "look at",
+    "help me",
+    "tell me",
+    "show me",
+    "check this",
+    "remember",
+    "what do you think",
+    "can you",
+    "could you",
+    "please",
     # German
-    "schau", "hilf mir", "sag mir", "zeig mir",
-    "kannst du", "könntest du", "bitte", "was denkst du",
-    "merk dir", "überprüf",
+    "schau",
+    "hilf mir",
+    "sag mir",
+    "zeig mir",
+    "kannst du",
+    "könntest du",
+    "bitte",
+    "was denkst du",
+    "merk dir",
+    "überprüf",
 ]
 
 QUESTION_WORDS = {
-    "who", "what", "where", "when", "why", "how",
-    "can", "could", "should", "is", "are", "do", "does",
-    "did", "will", "would", "have", "has",
+    "who",
+    "what",
+    "where",
+    "when",
+    "why",
+    "how",
+    "can",
+    "could",
+    "should",
+    "is",
+    "are",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "have",
+    "has",
     # German
-    "wer", "was", "wo", "wann", "warum", "wie",
-    "kann", "soll", "ist", "sind", "hat", "hatte",
+    "wer",
+    "was",
+    "wo",
+    "wann",
+    "warum",
+    "wie",
+    "kann",
+    "soll",
+    "ist",
+    "sind",
+    "hat",
+    "hatte",
 }
 
 # Single-word conversational responses that count as addressed during active conversation
 CONVERSATIONAL_RESPONSES = {
-    "yeah", "yes", "no", "nah", "sure", "okay", "ok", "thanks",
-    "right", "exactly", "correct", "yep", "nope", "absolutely",
-    "definitely", "alright",
+    "yeah",
+    "yes",
+    "no",
+    "nah",
+    "sure",
+    "okay",
+    "ok",
+    "thanks",
+    "right",
+    "exactly",
+    "correct",
+    "yep",
+    "nope",
+    "absolutely",
+    "definitely",
+    "alright",
     # German
-    "ja", "nein", "klar", "genau", "richtig", "stimmt",
-    "danke", "natürlich",
+    "ja",
+    "nein",
+    "klar",
+    "genau",
+    "richtig",
+    "stimmt",
+    "danke",
+    "natürlich",
 }
 
 # Minimum sentence length before flushing to TTS during streaming
@@ -154,6 +184,10 @@ SENTENCE_MIN_LENGTH = 10
 
 
 class ClaudeClient:
+    """Central Claude API client. Handles routing (Haiku tool-use),
+    conversation, frame analysis, intent classification, and streaming.
+    Includes retry with exponential backoff and per-response cost tracking."""
+
     def __init__(self, cost_tracker: CostTracker):
         self._client = None
         self._cost_tracker = cost_tracker
@@ -172,6 +206,7 @@ class ClaudeClient:
             return False
         try:
             import anthropic
+
             self._client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=0)
             response = self._call_with_retry(
                 model=FAST_MODEL,
@@ -264,17 +299,19 @@ class ClaudeClient:
         content = []
         if frame_bytes:
             image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": image_b64,
-                },
-            })
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                }
+            )
         content.append({"type": "text", "text": prompt})
 
-        system = SYSTEM_PROMPT_CONVERSATION
+        system = get_conversation_prompt()
         if language != "en":
             system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
 
@@ -295,7 +332,8 @@ class ClaudeClient:
         if not text:
             logger.warning(
                 "Claude chat returned empty response (model=%s, message=%.100s)",
-                model, message,
+                model,
+                message,
             )
             return None
         return text.strip()
@@ -329,22 +367,6 @@ class ClaudeClient:
             return None
         return text.strip()
 
-    def route_request(self, text: str) -> str:
-        """Use fast model to intelligently decide whether smart model is needed."""
-        prompt = ROUTING_PROMPT.format(request=text)
-        response = self._call_with_retry(
-            model=FAST_MODEL,
-            max_tokens=5,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if response:
-            resp_text = self._safe_response_text(response)
-            if resp_text and "smart" in resp_text.strip().lower():
-                logger.info("Routing decision: Smart (Sonnet)")
-                return SMART_MODEL
-        logger.info("Routing decision: Fast (Haiku)")
-        return FAST_MODEL
-
     def classify_intent(self, text: str) -> bool:
         """Classify whether transcribed speech is addressed to Winston.
 
@@ -363,35 +385,10 @@ class ClaudeClient:
             resp_text = self._safe_response_text(response)
             if resp_text:
                 result = "yes" in resp_text.strip().lower()
-                logger.info("Intent classification: '%s' -> %s",
-                            text[:60], "addressed" if result else "not addressed")
+                logger.info("Intent classification: '%s' -> %s", text[:60], "addressed" if result else "not addressed")
                 return result
         logger.warning("Intent classification failed, defaulting to True")
         return True
-
-    def classify_user_intent(self, text: str) -> dict:
-        """Classify user intent via Haiku. Returns {"intent": str, "note_content": str|None}.
-
-        Intents: "conversation", "shutdown", "agent", "note".
-        Used to replace keyword-based trigger matching with intelligent classification.
-        """
-        default = {"intent": "conversation", "note_content": None}
-        prompt = INTENT_CLASSIFICATION_FULL_PROMPT.format(text=text)
-        response = self._call_with_retry(
-            model=FAST_MODEL,
-            max_tokens=80,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if response:
-            self._track_usage(response, FAST_MODEL)
-            resp_text = self._safe_response_text(response)
-            if resp_text:
-                result = self._parse_json(resp_text)
-                if result and "intent" in result:
-                    logger.info("Intent classification: '%s' -> %s", text[:60], result.get("intent"))
-                    return result
-        logger.warning("Intent classification failed, defaulting to 'conversation'")
-        return default
 
     # ── Fast local classifiers (no API call) ──────────────────────────
 
@@ -444,45 +441,6 @@ class ClaudeClient:
         # Ambiguous — needs API
         return None
 
-    @staticmethod
-    def route_request_local(text: str) -> str:
-        """Route to Smart/Fast model using local keyword matching. Instant, no API."""
-        text_lower = text.lower()
-        for trigger in PRO_TRIGGER_PATTERNS:
-            if trigger in text_lower:
-                logger.info("Routing decision: Smart/Sonnet (local, keyword='%s')", trigger)
-                return SMART_MODEL
-        logger.info("Routing decision: Fast/Haiku (local)")
-        return FAST_MODEL
-
-    def classify_and_route(self, text: str) -> tuple[bool, str]:
-        """Combined intent + routing in a single API call.
-
-        Returns (is_addressed, model_name). Defaults to (True, FAST_MODEL) on failure.
-        """
-        prompt = COMBINED_INTENT_ROUTING_PROMPT.format(text=text)
-        response = self._call_with_retry(
-            model=FAST_MODEL,
-            max_tokens=5,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if response:
-            self._track_usage(response, FAST_MODEL)
-            resp_text = self._safe_response_text(response)
-            if resp_text:
-                resp_lower = resp_text.strip().lower()
-                if "no" in resp_lower and "yes" not in resp_lower:
-                    logger.info("Combined classify+route: not addressed (API)")
-                    return (False, FAST_MODEL)
-                elif "smart" in resp_lower:
-                    logger.info("Combined classify+route: addressed, Smart (API)")
-                    return (True, SMART_MODEL)
-                else:
-                    logger.info("Combined classify+route: addressed, Fast (API)")
-                    return (True, FAST_MODEL)
-        logger.warning("Combined classify+route failed, defaulting to (True, Fast)")
-        return (True, FAST_MODEL)
-
     # ── Streaming chat ────────────────────────────────────────────────
 
     def chat_streaming(
@@ -511,17 +469,19 @@ class ClaudeClient:
         content = []
         if frame_bytes:
             image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": image_b64,
-                },
-            })
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                }
+            )
         content.append({"type": "text", "text": prompt})
 
-        system = SYSTEM_PROMPT_CONVERSATION
+        system = get_conversation_prompt()
         if language != "en":
             system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
 
@@ -629,7 +589,6 @@ class ClaudeClient:
         conversation_history: list of {"role": "user"/"assistant", "content": str}
             for multi-turn context. Claude sees the full conversation flow.
         """
-        from config import SYSTEM_PROMPT_ROUTING
 
         # Build messages array with conversation history
         messages = []
@@ -645,14 +604,16 @@ class ClaudeClient:
         content = []
         if frame_bytes:
             image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": image_b64,
-                },
-            })
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                }
+            )
         content.append({"type": "text", "text": prompt})
 
         # Ensure proper alternation: if last history message is "user", merge
@@ -663,10 +624,11 @@ class ClaudeClient:
         else:
             messages.append({"role": "user", "content": content})
 
-        system = SYSTEM_PROMPT_ROUTING
+        system = get_routing_prompt()
         if language != "en":
             system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
 
+        t_llm_start = time.time()
         response = self._call_with_retry(
             model=FAST_MODEL,
             max_tokens=500,
@@ -674,6 +636,9 @@ class ClaudeClient:
             tools=ROUTING_TOOLS,
             messages=messages,
         )
+        llm_ms = (time.time() - t_llm_start) * 1000
+        logger.info("[latency] LLM first-token: %dms", llm_ms)
+        logger.info("[latency] LLM total: %dms", llm_ms)
         if response is None:
             return ("conversation", {"text": "Sorry, I couldn't process that. Try again?"})
 
@@ -701,6 +666,7 @@ class ClaudeClient:
 
                 elif tool_name == "get_current_time":
                     from datetime import datetime
+
                     now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
                     logger.info("Routing: get_current_time → %s", now)
                     return ("conversation", {"text": f"It's {now}."})
@@ -729,9 +695,10 @@ class ClaudeClient:
                 response = self._client.messages.create(**kwargs)
                 return response
             except Exception as e:
-                wait = BASE_BACKOFF * (2 ** attempt)
-                logger.warning("API call failed (attempt %d/%d): %s. Retrying in %.1fs",
-                               attempt + 1, MAX_RETRIES, e, wait)
+                wait = BASE_BACKOFF * (2**attempt)
+                logger.warning(
+                    "API call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt + 1, MAX_RETRIES, e, wait
+                )
                 time.sleep(wait)
 
         logger.error("API call failed after %d attempts", MAX_RETRIES)
