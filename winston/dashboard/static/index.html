@@ -4,22 +4,26 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WINSTON</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #f5f5f7;
-    --bg-panel: #ffffff;
-    --border: #d2d2d7;
-    --text: #1d1d1f;
-    --text-dim: #86868b;
-    --blue: #007AFF;
-    --green: #34C759;
-    --purple: #AF52DE;
-    --orange: #FF9500;
-    --red: #FF3B30;
-    --accent: var(--blue);
-    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
-    --shadow-lg: 0 4px 12px rgba(0,0,0,0.06), 0 2px 6px rgba(0,0,0,0.03);
-    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+    --bg: #1a1a1e;
+    --bg-panel: #242428;
+    --bg-input: #2e2e33;
+    --bg-hover: #34343a;
+    --border: #3a3a40;
+    --border-subtle: #2e2e34;
+    --text: #e4e4e8;
+    --text-dim: #8e8e96;
+    --text-muted: #5a5a62;
+    --blue: #4a9eff;
+    --green: #4ade80;
+    --amber: #fbbf24;
+    --purple: #a78bfa;
+    --red: #f87171;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -27,359 +31,526 @@
   body {
     background: var(--bg);
     color: var(--text);
-    min-height: 100vh;
-    overflow-x: hidden;
+    height: 100vh;
+    overflow: hidden;
   }
 
-  /* Header */
-  .header {
+  .app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  /* ===== Status Bar ===== */
+  .status-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 24px;
+    padding: 0 20px;
+    height: 48px;
+    min-height: 48px;
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border);
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    gap: 16px;
+    z-index: 10;
   }
-  .header-left {
+  .status-left {
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
+    min-width: 0;
   }
-  .logo {
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: 3px;
-    color: var(--text);
+  .status-dot {
+    width: 14px;
+    height: 14px;
+    min-width: 14px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background 0.5s, box-shadow 0.5s;
   }
-  .state-label {
+  .status-dot.idle {
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(74, 222, 128, 0.5);
+  }
+  .status-dot.online {
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(74, 222, 128, 0.5);
+  }
+  .status-dot.listening {
+    background: var(--green);
+    box-shadow: 0 0 12px rgba(74, 222, 128, 0.6);
+    animation: pulse 0.8s ease-in-out infinite;
+  }
+  .status-dot.thinking {
+    background: var(--amber);
+    box-shadow: 0 0 8px rgba(251, 191, 36, 0.5);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .status-dot.speaking {
+    background: var(--blue);
+    box-shadow: 0 0 8px rgba(74, 158, 255, 0.5);
+  }
+  .status-dot.initializing {
+    background: var(--text-muted);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .status-dot.error {
+    background: var(--red);
+    box-shadow: 0 0 8px rgba(248, 113, 113, 0.5);
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+
+  .status-label {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 1.5px;
-    padding: 5px 14px;
-    border-radius: 14px;
-    background: rgba(0, 122, 255, 0.08);
-    color: var(--blue);
-    transition: all 0.5s ease;
+    color: var(--text-dim);
+    transition: color 0.5s;
   }
-  .talk-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 7px 18px;
-    border-radius: 18px;
-    background: var(--blue);
-    color: white;
-    border: none;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    font-family: inherit;
-  }
-  .talk-btn:hover { background: #0066d6; transform: scale(1.02); }
-  .talk-btn:active { background: #0055b3; transform: scale(0.98); }
-  .talk-btn.secondary {
-    background: #e8e8ed;
-    color: var(--text);
-  }
-  .talk-btn.secondary:hover { background: #dcdce2; }
-  .talk-btn svg { width: 14px; height: 14px; }
-  .header-right {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-  .modules {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-  }
-  .module-dot {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 10px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+  .logo {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 3px;
     color: var(--text-dim);
   }
-  .module-dot .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--border);
-    transition: background 0.5s;
+  .status-center {
+    flex: 1;
+    max-width: 320px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
   }
-  .module-dot .dot.online { background: var(--green); }
-  .module-dot .dot.loading {
-    background: var(--orange);
-    animation: pulse-dot 1s ease-in-out infinite;
+  .cost-text {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
   }
-  .module-dot .dot.error { background: var(--red); }
+  .cost-track {
+    width: 100%;
+    height: 3px;
+    background: var(--bg-input);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .cost-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--blue);
+    border-radius: 2px;
+    transition: width 0.5s ease, background 0.5s ease;
+  }
+  .cost-fill.warn { background: var(--amber); }
+  .cost-fill.danger { background: var(--red); }
+
+  .status-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
   .uptime {
     font-size: 11px;
     font-weight: 500;
     color: var(--text-dim);
     font-variant-numeric: tabular-nums;
   }
-  .oww-hint {
-    font-size: 10px;
-    color: var(--orange);
-    font-weight: 500;
-    display: none;
-  }
-
-  @keyframes pulse-dot {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-
-  /* Neural Core Section */
-  .core-section {
-    position: relative;
+  .modules {
     display: flex;
-    justify-content: center;
+    gap: 8px;
     align-items: center;
-    height: 340px;
-    overflow: hidden;
-    background: linear-gradient(180deg, #eef0f3 0%, var(--bg) 100%);
   }
-  #neural-core {
-    display: block;
-  }
-
-  /* Info Grid */
-  .info-grid {
-    display: grid;
-    grid-template-columns: 1fr 1.3fr 1fr;
-    gap: 16px;
-    padding: 16px;
-    min-height: calc(100vh - 340px - 49px);
-  }
-  .panel {
-    background: var(--bg-panel);
-    border-radius: 16px;
-    padding: 20px;
-    border: 1px solid var(--border);
-    box-shadow: var(--shadow);
-    overflow-y: auto;
-  }
-  .panel-title {
-    font-size: 13px;
+  .module-dot {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
     font-weight: 600;
-    color: var(--text);
-    margin-bottom: 14px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .module-dot .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background 0.5s;
+  }
+  .module-dot .dot.online { background: var(--green); }
+  .module-dot .dot.loading {
+    background: var(--amber);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  .module-dot .dot.error { background: var(--red); }
+
+  .talk-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 14px;
+    border-radius: 14px;
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: inherit;
+  }
+  .talk-btn:hover { background: #3a8eef; }
+  .talk-btn:active { transform: scale(0.97); }
+  .talk-btn svg { width: 12px; height: 12px; }
+
+  /* ===== Main Content ===== */
+  .main-content {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    overflow: hidden;
   }
 
-  /* Camera Panel */
-  .camera-feed {
-    width: 100%;
-    border-radius: 12px;
-    background: #e8e8ed;
-    aspect-ratio: 16/9;
-    object-fit: cover;
-    box-shadow: var(--shadow);
-  }
-  .scene-desc {
-    margin-top: 12px;
-    font-size: 12px;
-    color: var(--text-dim);
-    line-height: 1.6;
-    min-height: 40px;
-  }
-
-  /* Conversation Panel */
-  .conversation {
+  /* ===== Conversation Panel ===== */
+  .conversation-panel {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    max-height: calc(100vh - 340px - 49px - 80px);
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .conv-header {
+    padding: 12px 20px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .conversation {
+    flex: 1;
     overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
   .msg {
     padding: 10px 14px;
     font-size: 13px;
     line-height: 1.5;
-    max-width: 85%;
+    max-width: 80%;
     word-wrap: break-word;
+    position: relative;
   }
   .msg.user {
     align-self: flex-end;
-    background: var(--blue);
-    color: white;
-    border-radius: 18px 18px 4px 18px;
+    background: rgba(74, 158, 255, 0.15);
+    color: var(--text);
+    border-radius: 16px 16px 4px 16px;
+    border: 1px solid rgba(74, 158, 255, 0.2);
   }
   .msg.winston {
     align-self: flex-start;
-    background: #e9e9eb;
+    background: var(--bg-input);
     color: var(--text);
-    border-radius: 18px 18px 18px 4px;
+    border-radius: 16px 16px 16px 4px;
+    border: 1px solid var(--border-subtle);
   }
   .msg.proactive {
     align-self: flex-start;
-    background: #f3edfa;
-    color: #6d28a0;
-    border-radius: 18px 18px 18px 4px;
+    background: rgba(167, 139, 250, 0.08);
+    color: var(--text);
+    border-radius: 16px 16px 16px 4px;
+    border: 1px solid rgba(167, 139, 250, 0.15);
     border-left: 3px solid var(--purple);
+  }
+  .msg.agent {
+    align-self: flex-start;
+    background: rgba(251, 191, 36, 0.06);
+    color: var(--text);
+    border-radius: 16px 16px 16px 4px;
+    border: 1px solid rgba(251, 191, 36, 0.12);
+    border-left: 3px solid var(--amber);
+  }
+  .msg-footer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 5px;
   }
   .msg-time {
     font-size: 10px;
-    color: rgba(0,0,0,0.35);
-    margin-top: 4px;
+    color: var(--text-muted);
   }
-  .msg.user .msg-time { color: rgba(255,255,255,0.6); }
+  .msg-tag {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+  .msg-tag.haiku {
+    background: rgba(74, 158, 255, 0.12);
+    color: var(--blue);
+  }
+  .msg-tag.opus {
+    background: rgba(251, 191, 36, 0.12);
+    color: var(--amber);
+  }
   .empty-state {
-    color: var(--text-dim);
+    color: var(--text-muted);
     font-size: 13px;
     text-align: center;
     padding: 40px 20px;
   }
 
-  /* System Panel */
-  .sys-section {
-    margin-bottom: 18px;
+  /* ===== Sidebar ===== */
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg-panel);
   }
-  .sys-section-title {
+
+  /* Live View */
+  .live-view {
+    padding: 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+  }
+  .camera-frame {
+    width: 100%;
+    border-radius: 8px;
+    background: var(--bg-input);
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    display: block;
+  }
+  .audio-section {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .audio-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    min-width: 40px;
+  }
+  .audio-track {
+    flex: 1;
+    height: 4px;
+    background: var(--bg-input);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .audio-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--green), var(--blue));
+    border-radius: 2px;
+    transition: width 0.08s linear;
+  }
+  .listen-state {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .listen-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: background 0.3s;
+  }
+  .listen-dot.active { background: var(--green); }
+  .listen-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  /* Latency Stats */
+  .latency-section {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .latency-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    padding: 2px 0;
+  }
+  .latency-row .label { color: var(--text-muted); }
+  .latency-row .value { color: var(--text-dim); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* Tabs */
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+  }
+  .tab {
+    flex: 1;
+    padding: 10px 0;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--text-dim);
-    margin-bottom: 8px;
+    color: var(--text-muted);
+    text-align: center;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
   }
-  .sys-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 12px;
-    padding: 4px 0;
+  .tab:hover { color: var(--text-dim); }
+  .tab.active {
+    color: var(--blue);
+    border-bottom-color: var(--blue);
+  }
+  .tab-content {
+    display: none;
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+  }
+  .tab-content.active { display: block; }
+
+  /* Memory Tab */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .stat-card {
+    background: var(--bg-input);
+    padding: 10px 12px;
+    border-radius: 8px;
+  }
+  .stat-value {
+    font-size: 20px;
+    font-weight: 700;
     color: var(--text);
+    font-variant-numeric: tabular-nums;
   }
-  .sys-row .label { color: var(--text-dim); }
-  .sys-row .value { font-weight: 500; font-variant-numeric: tabular-nums; }
-
-  /* Audio Level Bar */
-  .audio-bar-container {
-    height: 6px;
-    background: #e8e8ed;
-    border-radius: 3px;
-    overflow: hidden;
-    margin-top: 4px;
+  .stat-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
   }
-  .audio-bar {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, var(--blue), var(--green));
-    border-radius: 3px;
-    transition: width 0.08s linear;
+  .fact-group {
+    margin-bottom: 10px;
   }
-
-  /* Cost Bar */
-  .cost-bar-container {
-    height: 5px;
-    background: #e8e8ed;
-    border-radius: 3px;
-    overflow: hidden;
-    margin-top: 6px;
+  .fact-tag {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    margin-bottom: 6px;
   }
-  .cost-bar {
-    height: 100%;
-    width: 0%;
-    background: var(--blue);
-    border-radius: 3px;
-    transition: width 0.5s ease;
-  }
-  .cost-bar.warn { background: var(--orange); }
-  .cost-bar.danger { background: var(--red); }
-
-  /* Module load times */
-  .load-time-row {
-    display: flex;
-    justify-content: space-between;
+  .fact-tag.personal { background: rgba(74, 158, 255, 0.12); color: var(--blue); }
+  .fact-tag.equipment { background: rgba(74, 222, 128, 0.12); color: var(--green); }
+  .fact-tag.project { background: rgba(167, 139, 250, 0.12); color: var(--purple); }
+  .fact-tag.workshop { background: rgba(251, 191, 36, 0.12); color: var(--amber); }
+  .fact-tag.safety { background: rgba(248, 113, 113, 0.12); color: var(--red); }
+  .fact-tag.other { background: rgba(142, 142, 150, 0.12); color: var(--text-dim); }
+  .fact-item {
     font-size: 12px;
-    padding: 3px 0;
+    color: var(--text-dim);
+    padding: 3px 0 3px 10px;
+    border-left: 2px solid var(--border-subtle);
+    line-height: 1.4;
   }
-  .load-time-row .name { color: var(--text-dim); text-transform: capitalize; }
-  .load-time-row .time { color: var(--green); font-weight: 500; font-variant-numeric: tabular-nums; }
-
-  /* Observations */
+  .sub-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin: 14px 0 8px;
+  }
   .obs-item {
     font-size: 12px;
     color: var(--text-dim);
     line-height: 1.5;
     margin-bottom: 8px;
     padding-left: 10px;
-    border-left: 2px solid var(--border);
+    border-left: 2px solid var(--border-subtle);
   }
   .obs-time {
     font-size: 10px;
-    color: var(--border);
+    color: var(--text-muted);
     font-weight: 500;
   }
 
-  /* Scrollbar */
-  ::-webkit-scrollbar { width: 6px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #c7c7cc; border-radius: 3px; }
-
-  /* Connection status */
-  .conn-status {
-    position: fixed;
-    bottom: 12px;
-    right: 12px;
-    font-size: 10px;
-    font-weight: 500;
-    padding: 5px 12px;
-    border-radius: 12px;
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    box-shadow: var(--shadow);
-    z-index: 100;
-  }
-  .conn-status.connected { border-color: var(--green); color: var(--green); }
-  .conn-status.disconnected { border-color: var(--red); color: var(--red); }
-
-  /* Bottom Grid — Agent Tasks + Notes */
-  .info-grid-bottom {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    padding: 0 16px 16px;
-  }
-
-  /* Agent task cards */
+  /* Tasks Tab */
   .agent-task {
     padding: 12px;
     border-left: 3px solid var(--blue);
-    background: rgba(0, 122, 255, 0.04);
+    background: var(--bg-input);
     border-radius: 8px;
     font-size: 12px;
     margin-bottom: 8px;
   }
-  .agent-task.running { border-left-color: var(--orange); }
+  .agent-task.running {
+    border-left-color: var(--amber);
+    animation: pulse-border 2s ease-in-out infinite;
+  }
   .agent-task.failed { border-left-color: var(--red); }
   .agent-task.completed { border-left-color: var(--green); }
-  .agent-task .task-status {
+  .task-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .task-status {
     font-weight: 600;
     text-transform: uppercase;
     font-size: 10px;
     letter-spacing: 1px;
   }
-  .agent-task .task-query {
+  .task-status.running { color: var(--amber); }
+  .task-status.completed { color: var(--green); }
+  .task-status.failed { color: var(--red); }
+  .task-time {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .task-query {
     color: var(--text-dim);
     margin: 4px 0;
     line-height: 1.4;
   }
-  .agent-task .task-result {
+  .task-result {
     margin-top: 6px;
     padding-top: 6px;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--border-subtle);
     color: var(--text);
     white-space: pre-wrap;
     max-height: 100px;
@@ -387,39 +558,80 @@
     font-size: 11px;
     line-height: 1.5;
   }
-  .agent-task .task-time {
+  .task-result.expanded { max-height: none; }
+  .task-expand {
     font-size: 10px;
-    color: var(--border);
-    margin-top: 6px;
+    color: var(--blue);
+    cursor: pointer;
+    margin-top: 4px;
+    display: inline-block;
+  }
+  .task-expand:hover { text-decoration: underline; }
+
+  @keyframes pulse-border {
+    0%, 100% { border-left-color: var(--amber); }
+    50% { border-left-color: rgba(251, 191, 36, 0.3); }
   }
 
-  /* Note items — interactive checklist */
+  /* Notes Tab */
+  .add-note-form {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .add-note-form input {
+    flex: 1;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text);
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .add-note-form input::placeholder { color: var(--text-muted); }
+  .add-note-form input:focus { border-color: var(--blue); }
+  .add-note-form button {
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    width: 34px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    font-family: inherit;
+  }
+  .add-note-form button:hover { background: #3a8eef; }
   .note-item {
     display: flex;
     align-items: flex-start;
     gap: 10px;
     padding: 10px 12px;
-    background: var(--bg);
+    background: var(--bg-input);
     border-radius: 8px;
     margin-bottom: 6px;
     font-size: 13px;
   }
   .note-item.done .note-text {
     text-decoration: line-through;
-    color: var(--text-dim);
+    color: var(--text-muted);
   }
   .note-check {
     cursor: pointer;
-    width: 20px;
-    height: 20px;
-    min-width: 20px;
+    width: 18px;
+    height: 18px;
+    min-width: 18px;
     border: 2px solid var(--border);
-    border-radius: 6px;
-    flex-shrink: 0;
+    border-radius: 5px;
     display: flex;
     align-items: center;
     justify-content: center;
     transition: all 0.2s ease;
+    margin-top: 1px;
   }
   .note-check:hover { border-color: var(--blue); }
   .note-check.checked {
@@ -428,16 +640,16 @@
   }
   .note-check.checked::after {
     content: '\2713';
-    color: white;
-    font-size: 12px;
+    color: #1a1a1e;
+    font-size: 11px;
     font-weight: 700;
   }
-  .note-text { flex: 1; line-height: 1.4; }
-  .note-meta { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+  .note-text { flex: 1; line-height: 1.4; color: var(--text); }
+  .note-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
   .note-delete {
     cursor: pointer;
-    color: var(--text-dim);
-    font-size: 18px;
+    color: var(--text-muted);
+    font-size: 16px;
     line-height: 1;
     opacity: 0.3;
     transition: all 0.2s ease;
@@ -445,118 +657,160 @@
   }
   .note-delete:hover { opacity: 1; color: var(--red); }
 
-  @keyframes pulse-border {
-    0%, 100% { border-left-color: var(--orange); }
-    50% { border-left-color: rgba(255, 149, 0, 0.3); }
+  /* Connection status */
+  .conn-status {
+    position: fixed;
+    bottom: 12px;
+    right: 12px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 5px 12px;
+    border-radius: 12px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    z-index: 100;
+    transition: all 0.3s;
   }
-  .agent-task.running { animation: pulse-border 2s ease-in-out infinite; }
+  .conn-status.connected { border-color: var(--green); color: var(--green); }
+  .conn-status.reconnecting { border-color: var(--amber); color: var(--amber); }
+  .conn-status.disconnected { border-color: var(--red); color: var(--red); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+  /* ===== Responsive ===== */
+  @media (max-width: 768px) {
+    .status-bar {
+      padding: 0 12px;
+      gap: 8px;
+    }
+    .logo { display: none; }
+    .status-center { max-width: 160px; }
+    .modules { display: none; }
+
+    .main-content {
+      grid-template-columns: 1fr;
+      overflow-y: auto;
+    }
+    .conversation-panel {
+      border-right: none;
+      min-height: 50vh;
+    }
+    .sidebar {
+      border-top: 1px solid var(--border);
+    }
+  }
 </style>
 </head>
 <body>
 
-<!-- Header -->
-<div class="header">
-  <div class="header-left">
-    <div class="logo">WINSTON</div>
-    <div class="state-label" id="state-label">INITIALIZING</div>
-  </div>
-  <div class="header-right">
-    <button class="talk-btn" id="talk-btn" onclick="dashboard.triggerListen()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-      Talk to Winston
-    </button>
-    <div class="modules">
-      <div class="module-dot"><span class="dot" id="dot-camera"></span>CAM</div>
-      <div class="module-dot"><span class="dot" id="dot-audio"></span>MIC</div>
-      <div class="module-dot"><span class="dot" id="dot-memory"></span>MEM</div>
-      <div class="module-dot"><span class="dot" id="dot-gemini"></span>AI</div>
-      <div class="module-dot"><span class="dot" id="dot-tts"></span>TTS</div>
+<div class="app">
+  <!-- Status Bar -->
+  <div class="status-bar">
+    <div class="status-left">
+      <div class="status-dot" id="status-dot"></div>
+      <span class="status-label" id="status-label">INITIALIZING</span>
+      <span class="logo">WINSTON</span>
     </div>
-    <span class="uptime" id="uptime">00:00:00</span>
-  </div>
-</div>
-
-<!-- Neural Core -->
-<div class="core-section">
-  <canvas id="neural-core"></canvas>
-</div>
-
-<!-- Info Grid -->
-<div class="info-grid">
-  <!-- Camera Panel -->
-  <div class="panel">
-    <div class="panel-title">Camera Feed</div>
-    <img class="camera-feed" id="camera-feed" src="/camera/stream" alt="Camera">
-    <div class="scene-desc" id="scene-desc">Waiting for scene analysis...</div>
-  </div>
-
-  <!-- Conversation Panel -->
-  <div class="panel">
-    <div class="panel-title">Conversation</div>
-    <div class="conversation" id="conversation">
-      <div class="empty-state">Press the Talk button or just start speaking</div>
+    <div class="status-center">
+      <span class="cost-text" id="cost-text">$0.00 / $2.00</span>
+      <div class="cost-track">
+        <div class="cost-fill" id="cost-fill"></div>
+      </div>
+    </div>
+    <div class="status-right">
+      <span class="uptime" id="uptime">00:00:00</span>
+      <div class="modules" id="modules">
+        <div class="module-dot"><span class="dot" id="dot-camera"></span>CAM</div>
+        <div class="module-dot"><span class="dot" id="dot-audio"></span>MIC</div>
+        <div class="module-dot"><span class="dot" id="dot-memory"></span>MEM</div>
+        <div class="module-dot"><span class="dot" id="dot-llm"></span>AI</div>
+        <div class="module-dot"><span class="dot" id="dot-tts"></span>TTS</div>
+      </div>
+      <button class="talk-btn" id="talk-btn" onclick="dashboard.triggerListen()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+        Talk
+      </button>
     </div>
   </div>
 
-  <!-- System Panel -->
-  <div class="panel">
-    <div class="panel-title">System</div>
-
-    <div class="sys-section">
-      <div class="sys-section-title">Audio Level</div>
-      <div class="audio-bar-container">
-        <div class="audio-bar" id="audio-bar"></div>
+  <!-- Main Content -->
+  <div class="main-content">
+    <!-- Conversation -->
+    <div class="conversation-panel">
+      <div class="conv-header">Conversation</div>
+      <div class="conversation" id="conversation">
+        <div class="empty-state">Speak or press Talk to start a conversation</div>
       </div>
     </div>
 
-    <div class="sys-section">
-      <div class="sys-section-title">Startup</div>
-      <div id="load-times"></div>
-    </div>
-
-    <div class="sys-section">
-      <div class="sys-section-title">Memory</div>
-      <div class="sys-row">
-        <span class="label">Episodes</span>
-        <span class="value" id="mem-episodes">0</span>
+    <!-- Sidebar -->
+    <div class="sidebar">
+      <!-- Live View -->
+      <div class="live-view">
+        <div class="section-label">Live View</div>
+        <img class="camera-frame" id="camera-frame" alt="Camera">
+        <div class="audio-section">
+          <span class="audio-label">Audio</span>
+          <div class="audio-track">
+            <div class="audio-fill" id="audio-fill"></div>
+          </div>
+        </div>
+        <div class="listen-state">
+          <div class="listen-dot" id="listen-dot"></div>
+          <span class="listen-label" id="listen-label">Always-listen: idle</span>
+        </div>
+        <div class="latency-section" id="latency-section" style="display:none">
+          <div class="section-label" style="margin-bottom:4px">Latency</div>
+          <div id="latency-stats"></div>
+        </div>
       </div>
-      <div class="sys-row">
-        <span class="label">Facts</span>
-        <span class="value" id="mem-facts">0</span>
+
+      <!-- Tabs -->
+      <div class="tab-bar">
+        <div class="tab active" data-tab="memory">Memory</div>
+        <div class="tab" data-tab="tasks">Tasks</div>
+        <div class="tab" data-tab="notes">Notes</div>
       </div>
-    </div>
 
-    <div class="sys-section">
-      <div class="sys-section-title">API Cost</div>
-      <div class="sys-row">
-        <span class="label">Today</span>
-        <span class="value" id="cost-value">$0.00</span>
+      <!-- Memory Tab -->
+      <div class="tab-content active" id="tab-memory">
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="mem-episodes">0</div>
+            <div class="stat-label">Episodes</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="mem-facts">0</div>
+            <div class="stat-label">Facts</div>
+          </div>
+        </div>
+        <div id="facts-list"></div>
+        <div class="sub-label">Recent Observations</div>
+        <div id="observations"><span class="empty-state" style="padding:10px;">No observations yet</span></div>
       </div>
-      <div class="cost-bar-container">
-        <div class="cost-bar" id="cost-bar"></div>
+
+      <!-- Tasks Tab -->
+      <div class="tab-content" id="tab-tasks">
+        <div id="agent-tasks">
+          <span class="empty-state">No investigations yet</span>
+        </div>
       </div>
-    </div>
 
-    <div class="sys-section">
-      <div class="sys-section-title">Observations</div>
-      <div id="observations"><span class="obs-item" style="border:none;padding:0;">No observations yet</span></div>
-    </div>
-  </div>
-</div>
-
-<!-- Bottom Grid — Agent Tasks + Notes -->
-<div class="info-grid-bottom">
-  <div class="panel">
-    <div class="panel-title">Agent Investigations</div>
-    <div id="agent-tasks">
-      <span class="empty-state">No investigations yet</span>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="panel-title">Notes</div>
-    <div id="notes-list">
-      <span class="empty-state">Say "write this down" to add a note</span>
+      <!-- Notes Tab -->
+      <div class="tab-content" id="tab-notes">
+        <form class="add-note-form" id="add-note-form">
+          <input type="text" placeholder="Add a note..." id="note-input" autocomplete="off">
+          <button type="submit">+</button>
+        </form>
+        <div id="notes-list">
+          <span class="empty-state">No notes yet</span>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -564,251 +818,71 @@
 <div class="conn-status disconnected" id="conn-status">DISCONNECTED</div>
 
 <script>
-// ==========================================
-// Neural Core — Elegant Particle Visualization
-// ==========================================
-class NeuralCore {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
-    this.particles = [];
-    this.state = 'initializing';
-    this.targetState = 'initializing';
-    this.audioLevel = 0;
-    this.time = 0;
-
-    // Color (smoothly interpolated)
-    this.color = { r: 0, g: 122, b: 255 };
-    this.targetColor = { r: 0, g: 122, b: 255 };
-
-    // Parameters (smoothly interpolated)
-    this.params = { speed: 1, gravity: 0, spread: 1, pulseRate: 1, glowSize: 15 };
-    this.targetParams = { ...this.params };
-
-    this.resize();
-    this.initParticles();
-
-    window.addEventListener('resize', () => this.resize());
-  }
-
-  resize() {
-    const section = this.canvas.parentElement;
-    this.canvas.width = section.clientWidth;
-    this.canvas.height = section.clientHeight;
-    this.cx = this.canvas.width / 2;
-    this.cy = this.canvas.height / 2;
-  }
-
-  initParticles() {
-    const count = 160;
-    for (let i = 0; i < count; i++) {
-      const layer = i < 35 ? 0 : i < 90 ? 1 : 2;
-      const baseRadius = layer === 0 ? 50 : layer === 1 ? 100 : 160;
-      const angle = Math.random() * Math.PI * 2;
-      const radius = baseRadius + (Math.random() - 0.5) * 25;
-
-      this.particles.push({
-        angle,
-        radius,
-        baseRadius,
-        layer,
-        size: 0.6 + Math.random() * 1.2,
-        alpha: 0.2 + Math.random() * 0.4,
-        speed: (0.002 + Math.random() * 0.003) * (layer === 0 ? 1.5 : layer === 1 ? 1 : 0.5),
-        offset: Math.random() * Math.PI * 2,
-        x: 0, y: 0,
-      });
-    }
-  }
-
-  setState(newState) {
-    if (newState === this.targetState) return;
-    this.targetState = newState;
-
-    const states = {
-      initializing: { color: { r: 160, g: 168, b: 176 }, speed: 0.5, gravity: 0, spread: 1, pulseRate: 0.5, glowSize: 10 },
-      idle:         { color: { r: 0, g: 122, b: 255 },   speed: 1,   gravity: 0, spread: 1, pulseRate: 1,   glowSize: 15 },
-      listening:    { color: { r: 52, g: 199, b: 89 },    speed: 1.5, gravity: 0.3, spread: 0.7, pulseRate: 2, glowSize: 20 },
-      thinking:     { color: { r: 175, g: 82, b: 222 },   speed: 3,   gravity: -0.2, spread: 1.4, pulseRate: 3, glowSize: 25 },
-      speaking:     { color: { r: 255, g: 149, b: 0 },    speed: 1.2, gravity: 0, spread: 1.1, pulseRate: 2, glowSize: 20 },
-    };
-
-    const s = states[newState] || states.idle;
-    this.targetColor = s.color;
-    this.targetParams = { speed: s.speed, gravity: s.gravity, spread: s.spread, pulseRate: s.pulseRate, glowSize: s.glowSize };
-  }
-
-  lerp(a, b, t) { return a + (b - a) * t; }
-
-  update(dt) {
-    this.time += dt;
-    const t = 0.035;
-
-    this.color.r = this.lerp(this.color.r, this.targetColor.r, t);
-    this.color.g = this.lerp(this.color.g, this.targetColor.g, t);
-    this.color.b = this.lerp(this.color.b, this.targetColor.b, t);
-
-    for (const k of Object.keys(this.params)) {
-      this.params[k] = this.lerp(this.params[k], this.targetParams[k], t);
-    }
-
-    const audioBoost = 1 + this.audioLevel * 3;
-
-    for (const p of this.particles) {
-      p.angle += p.speed * this.params.speed * dt * 60 * (1 + this.audioLevel * 0.5);
-
-      const gravityEffect = this.params.gravity * 0.5;
-      const targetRadius = p.baseRadius * this.params.spread + gravityEffect * -50;
-      p.radius = this.lerp(p.radius, targetRadius, 0.02);
-
-      const audioDisplace = this.audioLevel * 12 * Math.sin(this.time * 3 + p.offset);
-      const pulse = Math.sin(this.time * this.params.pulseRate + p.offset) * 4;
-
-      p.x = this.cx + Math.cos(p.angle) * (p.radius + pulse + audioDisplace);
-      p.y = this.cy + Math.sin(p.angle) * (p.radius + pulse + audioDisplace);
-    }
-  }
-
-  render() {
-    const ctx = this.ctx;
-    const w = this.canvas.width;
-    const h = this.canvas.height;
-    const { r, g, b } = this.color;
-
-    // Light trail fade
-    ctx.fillStyle = 'rgba(238, 240, 243, 0.25)';
-    ctx.fillRect(0, 0, w, h);
-
-    // Connections between nearby particles
-    ctx.lineWidth = 0.4;
-    for (let i = 0; i < this.particles.length; i++) {
-      for (let j = i + 1; j < this.particles.length; j++) {
-        const a = this.particles[i];
-        const bP = this.particles[j];
-        const dx = a.x - bP.x;
-        const dy = a.y - bP.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 55) {
-          const alpha = (1 - dist / 55) * 0.12;
-          ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(bP.x, bP.y);
-          ctx.stroke();
-        }
-      }
-    }
-
-    // Particles
-    for (const p of this.particles) {
-      const alpha = p.alpha * (0.5 + 0.5 * Math.sin(this.time * 2 + p.offset));
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-      ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.3)`;
-      ctx.shadowBlur = 4;
-      ctx.fill();
-    }
-    ctx.shadowBlur = 0;
-
-    // Core glow (softer)
-    const coreSize = this.params.glowSize + Math.sin(this.time * this.params.pulseRate) * 4 + this.audioLevel * 15;
-    const gradient = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, coreSize * 2.5);
-    gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.25)`);
-    gradient.addColorStop(0.4, `rgba(${r}, ${g}, ${b}, 0.06)`);
-    gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, coreSize * 2.5, 0, Math.PI * 2);
-    ctx.fillStyle = gradient;
-    ctx.fill();
-
-    // Inner core
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, coreSize * 0.25, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.6)`;
-    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.5)`;
-    ctx.shadowBlur = 15;
-    ctx.fill();
-    ctx.shadowBlur = 0;
-
-    // Speaking ripples
-    if (this.targetState === 'speaking' && this.audioLevel > 0.01) {
-      for (let i = 0; i < 3; i++) {
-        const phase = (this.time * 1.5 + i * 0.7) % 3;
-        const rippleR = phase * 70;
-        const rippleAlpha = Math.max(0, 0.1 - phase * 0.035);
-        ctx.beginPath();
-        ctx.arc(this.cx, this.cy, rippleR, 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${rippleAlpha})`;
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-    }
-
-    // State label
-    ctx.font = '500 10px -apple-system, system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.35)`;
-    ctx.letterSpacing = '2px';
-    ctx.fillText(this.targetState.toUpperCase(), this.cx, this.cy + coreSize * 2.5 + 18);
-  }
-}
-
-// ==========================================
-// Dashboard Controller
-// ==========================================
 class Dashboard {
   constructor() {
     this.ws = null;
+    this.reconnectDelay = 1000;
+    this.maxReconnectDelay = 30000;
     this.lastConversationLen = 0;
-    this.reconnectTimeout = null;
-    this.wakeWordReady = false;
+    this.activeTab = 'memory';
+    this.factsLoaded = false;
+    this._lastTasks = [];
+    this._lastNotes = [];
+    this._lastObs = [];
 
     this.el = {
-      stateLabel: document.getElementById('state-label'),
+      statusDot: document.getElementById('status-dot'),
+      statusLabel: document.getElementById('status-label'),
+      costText: document.getElementById('cost-text'),
+      costFill: document.getElementById('cost-fill'),
       uptime: document.getElementById('uptime'),
-      cameraFeed: document.getElementById('camera-feed'),
-      sceneDesc: document.getElementById('scene-desc'),
       conversation: document.getElementById('conversation'),
-      audioBar: document.getElementById('audio-bar'),
-      loadTimes: document.getElementById('load-times'),
+      cameraFrame: document.getElementById('camera-frame'),
+      audioFill: document.getElementById('audio-fill'),
+      listenDot: document.getElementById('listen-dot'),
+      listenLabel: document.getElementById('listen-label'),
+      latencySection: document.getElementById('latency-section'),
+      latencyStats: document.getElementById('latency-stats'),
       memEpisodes: document.getElementById('mem-episodes'),
       memFacts: document.getElementById('mem-facts'),
-      costValue: document.getElementById('cost-value'),
-      costBar: document.getElementById('cost-bar'),
+      factsList: document.getElementById('facts-list'),
       observations: document.getElementById('observations'),
-      connStatus: document.getElementById('conn-status'),
-      talkBtn: document.getElementById('talk-btn'),
-      owwHint: document.getElementById('oww-hint'),
       agentTasks: document.getElementById('agent-tasks'),
       notesList: document.getElementById('notes-list'),
+      connStatus: document.getElementById('conn-status'),
+      talkBtn: document.getElementById('talk-btn'),
+      addNoteForm: document.getElementById('add-note-form'),
+      noteInput: document.getElementById('note-input'),
     };
 
     this.dots = {};
-    for (const m of ['camera', 'audio', 'memory', 'gemini', 'tts']) {
+    for (const m of ['camera', 'audio', 'memory', 'llm', 'tts']) {
       this.dots[m] = document.getElementById('dot-' + m);
     }
 
-    this.core = new NeuralCore(document.getElementById('neural-core'));
-
     this.connect();
-    this.animate();
+    this.setupTabs();
+    this.setupNoteForm();
+    this.startCameraRefresh();
+    this.loadFacts();
   }
 
+  // ===== WebSocket with exponential backoff =====
   connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     this.ws = new WebSocket(`${proto}://${location.host}/ws`);
 
     this.ws.onopen = () => {
+      this.reconnectDelay = 1000;
       this.el.connStatus.textContent = 'CONNECTED';
       this.el.connStatus.className = 'conn-status connected';
     };
 
     this.ws.onclose = () => {
-      this.el.connStatus.textContent = 'DISCONNECTED';
-      this.el.connStatus.className = 'conn-status disconnected';
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = setTimeout(() => this.connect(), 2000);
+      this.el.connStatus.textContent = 'RECONNECTING...';
+      this.el.connStatus.className = 'conn-status reconnecting';
+      setTimeout(() => this.connect(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
     };
 
     this.ws.onerror = () => {};
@@ -820,137 +894,137 @@ class Dashboard {
     };
   }
 
+  // ===== Full state update =====
   handleState(data) {
-    // Status & Neural Core
-    this.core.setState(data.status);
-    this.el.stateLabel.textContent = data.status.toUpperCase();
-    const colorMap = {
-      idle: { c: 'var(--blue)', bg: 'rgba(0,122,255,0.08)' },
-      listening: { c: 'var(--green)', bg: 'rgba(52,199,89,0.08)' },
-      thinking: { c: 'var(--purple)', bg: 'rgba(175,82,222,0.08)' },
-      speaking: { c: 'var(--orange)', bg: 'rgba(255,149,0,0.08)' },
-      initializing: { c: 'var(--text-dim)', bg: 'rgba(134,134,139,0.08)' },
-    };
-    const st = colorMap[data.status] || colorMap.idle;
-    this.el.stateLabel.style.color = st.c;
-    this.el.stateLabel.style.background = st.bg;
-
-    // Wake word status & Talk button
-    this.wakeWordReady = data.wakeWordReady;
+    // Status dot + label
+    this.el.statusDot.className = 'status-dot ' + (data.status || 'initializing');
+    this.el.statusLabel.textContent = (data.status || 'initializing').toUpperCase();
 
     // Uptime
-    const secs = Math.floor(data.uptime);
+    const secs = Math.floor(data.uptime || 0);
     const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
     const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
     const ss = String(secs % 60).padStart(2, '0');
     this.el.uptime.textContent = `${hh}:${mm}:${ss}`;
 
     // Module dots
-    for (const [name, info] of Object.entries(data.modules)) {
+    for (const [name, info] of Object.entries(data.modules || {})) {
       const dot = this.dots[name];
       if (dot) dot.className = 'dot ' + info.status;
     }
 
-    // Load times
-    const timesHtml = Object.entries(data.modules).map(([name, info]) => {
-      const t = info.load_time_ms;
-      const timeStr = t != null ? (t > 1000 ? (t / 1000).toFixed(1) + 's' : Math.round(t) + 'ms') : '...';
-      return `<div class="load-time-row"><span class="name">${name}</span><span class="time">${timeStr}</span></div>`;
-    }).join('');
-    this.el.loadTimes.innerHTML = timesHtml;
-
-    // Audio
-    this.core.audioLevel = data.audioLevel;
-    this.el.audioBar.style.width = Math.min(100, data.audioLevel * 500) + '%';
-
-    // Memory
-    this.el.memEpisodes.textContent = data.memoryEpisodes;
-    this.el.memFacts.textContent = data.memoryFacts;
-
     // Cost
-    this.el.costValue.textContent = '$' + data.costToday.toFixed(2) + ' / $' + data.budgetMax.toFixed(2);
-    const costPct = (data.costToday / data.budgetMax) * 100;
-    this.el.costBar.style.width = Math.min(100, costPct) + '%';
-    this.el.costBar.className = 'cost-bar' + (costPct > 90 ? ' danger' : costPct > 75 ? ' warn' : '');
+    const cost = data.costToday || 0;
+    const budget = data.budgetMax || 2.0;
+    this.el.costText.textContent = `$${cost.toFixed(2)} / $${budget.toFixed(2)}`;
+    const costPct = (cost / budget) * 100;
+    this.el.costFill.style.width = Math.min(100, costPct) + '%';
+    this.el.costFill.className = 'cost-fill' + (costPct > 90 ? ' danger' : costPct > 75 ? ' warn' : '');
+
+    // Audio level
+    this.el.audioFill.style.width = Math.min(100, (data.audioLevel || 0) * 500) + '%';
+
+    // Always-listen state
+    const listenState = data.alwaysListenState || 'disabled';
+    const isActive = listenState !== 'disabled' && listenState !== 'idle';
+    this.el.listenDot.className = 'listen-dot' + (isActive ? ' active' : '');
+    this.el.listenLabel.textContent = 'Always-listen: ' + listenState;
+
+    // Latency stats (if available)
+    if (data.latencyStats && data.latencyStats.interaction_count > 0) {
+      this.el.latencySection.style.display = '';
+      const ls = data.latencyStats;
+      this.el.latencyStats.innerHTML = `
+        <div class="latency-row"><span class="label">Avg total</span><span class="value">${Math.round(ls.avg_total_ms || 0)}ms</span></div>
+        <div class="latency-row"><span class="label">Avg STT</span><span class="value">${Math.round(ls.avg_stt_ms || 0)}ms</span></div>
+        <div class="latency-row"><span class="label">Avg LLM</span><span class="value">${Math.round(ls.avg_llm_ms || 0)}ms</span></div>
+        <div class="latency-row"><span class="label">Avg TTS</span><span class="value">${Math.round(ls.avg_tts_ms || 0)}ms</span></div>
+        <div class="latency-row"><span class="label">Interactions</span><span class="value">${ls.interaction_count || 0}</span></div>
+      `;
+    }
+
+    // Memory stats
+    this.el.memEpisodes.textContent = data.memoryEpisodes || 0;
+    this.el.memFacts.textContent = data.memoryFacts || 0;
 
     // Conversation
-    if (data.conversation.length !== this.lastConversationLen) {
+    if (data.conversation && data.conversation.length !== this.lastConversationLen) {
       this.lastConversationLen = data.conversation.length;
       if (data.conversation.length === 0) {
-        this.el.conversation.innerHTML = '<div class="empty-state">Press the Talk button or just start speaking</div>';
+        this.el.conversation.innerHTML = '<div class="empty-state">Speak or press Talk to start a conversation</div>';
       } else {
         this.el.conversation.innerHTML = data.conversation.map(m => {
-          const cls = m.role === 'user' ? 'user' : m.role === 'proactive' ? 'proactive' : 'winston';
-          return `<div class="msg ${cls}">${this.escapeHtml(m.text)}<div class="msg-time">${m.timestamp}</div></div>`;
+          const role = m.role || 'winston';
+          const roleConfig = {
+            user:      { cls: 'user',      tag: '' },
+            winston:   { cls: 'winston',   tag: '<span class="msg-tag haiku">Haiku</span>' },
+            proactive: { cls: 'proactive', tag: '<span class="msg-tag haiku">Haiku</span>' },
+            agent:     { cls: 'agent',     tag: '<span class="msg-tag opus">Opus</span>' },
+          };
+          const cfg = roleConfig[role] || roleConfig.winston;
+          return `<div class="msg ${cfg.cls}">${this.esc(m.text)}<div class="msg-footer"><span class="msg-time">${m.timestamp || ''}</span>${cfg.tag}</div></div>`;
         }).join('');
         this.el.conversation.scrollTop = this.el.conversation.scrollHeight;
       }
     }
 
-    // Observations
-    const obs = data.observations.slice(-5);
-    this.el.observations.innerHTML = obs.length
-      ? obs.map(o => `<div class="obs-item"><span class="obs-time">${o.timestamp}</span> ${this.escapeHtml(o.description)}</div>`).join('')
-      : '<span class="obs-item" style="border:none;padding:0;">No observations yet</span>';
+    // Cache data for tab switches
+    this._lastObs = (data.observations || []).slice(-5);
+    this._lastTasks = data.agentTasks || [];
+    this._lastNotes = data.notes || [];
 
-    // Scene description
-    if (obs.length > 0) {
-      this.el.sceneDesc.textContent = obs[obs.length - 1].description;
+    // Render active tab content
+    if (this.activeTab === 'memory') {
+      this.el.observations.innerHTML = this._lastObs.length
+        ? this._lastObs.map(o => `<div class="obs-item"><span class="obs-time">${o.timestamp}</span> ${this.esc(o.description)}</div>`).join('')
+        : '<span class="empty-state" style="padding:10px;">No observations yet</span>';
     }
+    if (this.activeTab === 'tasks') {
+      this.renderTasks(this._lastTasks);
+    }
+    if (this.activeTab === 'notes') {
+      this.renderNotes(this._lastNotes);
+    }
+  }
 
-    // Agent Tasks
-    const tasks = data.agentTasks || [];
+  handleAudio(data) {
+    this.el.audioFill.style.width = Math.min(100, (data.audioLevel || 0) * 500) + '%';
+  }
+
+  // ===== Agent Tasks =====
+  renderTasks(tasks) {
     if (tasks.length > 0) {
       this.el.agentTasks.innerHTML = tasks.slice(-10).reverse().map(t => {
-        const statusColor = t.status === 'running' ? 'var(--orange)' : t.status === 'completed' ? 'var(--green)' : 'var(--red)';
         const resultHtml = t.result
-          ? `<div class="task-result">${this.escapeHtml(t.result.substring(0, 500))}</div>`
-          : (t.status === 'running' ? '<div class="task-result" style="color:var(--orange)">Investigating...</div>' : '');
+          ? `<div class="task-result">${this.esc(t.result.substring(0, 500))}</div>${t.result.length > 500 ? '<span class="task-expand" onclick="this.previousElementSibling.classList.toggle(\'expanded\');this.textContent=this.previousElementSibling.classList.contains(\'expanded\')?\'Show less\':\'Show more\'">Show more</span>' : ''}`
+          : (t.status === 'running' ? '<div class="task-result" style="color:var(--amber)">Investigating...</div>' : '');
         return `<div class="agent-task ${t.status}">
-          <div class="task-status" style="color:${statusColor}">${t.status}</div>
-          <div class="task-query">${this.escapeHtml(t.query || '')}</div>
+          <div class="task-header"><span class="task-status ${t.status}">${t.status}</span><span class="task-time">${t.created_at || ''}</span></div>
+          <div class="task-query">${this.esc(t.query || '')}</div>
           ${resultHtml}
-          <div class="task-time">${t.created_at || ''}</div>
         </div>`;
       }).join('');
     } else {
       this.el.agentTasks.innerHTML = '<span class="empty-state">No investigations yet</span>';
     }
+  }
 
-    // Notes
-    const notes = data.notes || [];
+  // ===== Notes =====
+  renderNotes(notes) {
     if (notes.length > 0) {
       this.el.notesList.innerHTML = notes.map(n => `
         <div class="note-item ${n.done ? 'done' : ''}" data-id="${n.id}">
           <div class="note-check ${n.done ? 'checked' : ''}" onclick="dashboard.toggleNote('${n.id}')"></div>
           <div style="flex:1">
-            <div class="note-text">${this.escapeHtml(n.text)}</div>
+            <div class="note-text">${this.esc(n.text)}</div>
             <div class="note-meta">${n.created_at ? new Date(n.created_at).toLocaleString() : ''}</div>
           </div>
           <div class="note-delete" onclick="dashboard.deleteNote('${n.id}')">&times;</div>
         </div>
       `).join('');
     } else {
-      this.el.notesList.innerHTML = '<span class="empty-state">Say "write this down" to add a note</span>';
+      this.el.notesList.innerHTML = '<span class="empty-state">No notes yet</span>';
     }
-  }
-
-  handleAudio(data) {
-    this.core.audioLevel = data.audioLevel;
-    this.el.audioBar.style.width = Math.min(100, data.audioLevel * 500) + '%';
-  }
-
-  triggerListen() {
-    this.el.talkBtn.style.opacity = '0.6';
-    fetch('/api/listen', { method: 'POST' })
-      .then(r => r.json())
-      .then(data => {
-        this.el.talkBtn.style.opacity = '1';
-      })
-      .catch(err => {
-        console.error('Listen trigger failed:', err);
-        this.el.talkBtn.style.opacity = '1';
-      });
   }
 
   toggleNote(id) {
@@ -961,21 +1035,100 @@ class Dashboard {
     fetch(`/api/notes/${id}`, { method: 'DELETE' }).catch(e => console.error('Delete failed:', e));
   }
 
-  escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+  setupNoteForm() {
+    this.el.addNoteForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = this.el.noteInput.value.trim();
+      if (!text) return;
+      this.el.noteInput.value = '';
+      fetch('/api/notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }).catch(err => console.error('Create note failed:', err));
+    });
   }
 
-  animate() {
-    const dt = 1 / 60;
-    this.core.update(dt);
-    this.core.render();
-    requestAnimationFrame(() => this.animate());
+  // ===== Tabs =====
+  setupTabs() {
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelector('.tab.active').classList.remove('active');
+        document.querySelector('.tab-content.active').classList.remove('active');
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        this.activeTab = tab.dataset.tab;
+
+        // Render cached data for newly active tab
+        if (tab.dataset.tab === 'memory') {
+          if (!this.factsLoaded) this.loadFacts();
+          this.el.observations.innerHTML = this._lastObs.length
+            ? this._lastObs.map(o => `<div class="obs-item"><span class="obs-time">${o.timestamp}</span> ${this.esc(o.description)}</div>`).join('')
+            : '<span class="empty-state" style="padding:10px;">No observations yet</span>';
+        }
+        if (tab.dataset.tab === 'tasks') this.renderTasks(this._lastTasks);
+        if (tab.dataset.tab === 'notes') this.renderNotes(this._lastNotes);
+      });
+    });
+  }
+
+  // ===== Camera (periodic snapshot) =====
+  startCameraRefresh() {
+    const refresh = () => {
+      this.el.cameraFrame.src = '/api/camera/frame?t=' + Date.now();
+    };
+    refresh();
+    setInterval(refresh, 3000);
+  }
+
+  // ===== Structured Facts =====
+  loadFacts() {
+    fetch('/api/facts/structured')
+      .then(r => r.json())
+      .then(data => {
+        this.factsLoaded = true;
+        const facts = data.facts || [];
+        if (!facts.length) {
+          this.el.factsList.innerHTML = '<span class="empty-state" style="padding:10px;">No facts stored yet</span>';
+          return;
+        }
+        const grouped = {};
+        facts.forEach(f => {
+          const cat = f.category || 'other';
+          (grouped[cat] = grouped[cat] || []).push(f);
+        });
+        let html = '';
+        for (const [cat, items] of Object.entries(grouped).sort()) {
+          html += `<div class="fact-group"><span class="fact-tag ${cat}">${cat}</span>`;
+          items.forEach(f => {
+            html += `<div class="fact-item">${this.esc(f.entity || '')}: ${this.esc(f.attribute || '')} = ${this.esc(String(f.value || ''))}</div>`;
+          });
+          html += '</div>';
+        }
+        this.el.factsList.innerHTML = html;
+      })
+      .catch(() => {
+        this.el.factsList.innerHTML = '<span class="empty-state" style="padding:10px;">Could not load facts</span>';
+      });
+  }
+
+  // ===== Talk Button =====
+  triggerListen() {
+    this.el.talkBtn.style.opacity = '0.5';
+    fetch('/api/listen', { method: 'POST' })
+      .then(r => r.json())
+      .then(() => { this.el.talkBtn.style.opacity = '1'; })
+      .catch(() => { this.el.talkBtn.style.opacity = '1'; });
+  }
+
+  // ===== XSS-safe HTML escaping =====
+  esc(text) {
+    const div = document.createElement('div');
+    div.textContent = text || '';
+    return div.innerHTML;
   }
 }
 
-// Boot
 let dashboard;
 window.addEventListener('DOMContentLoaded', () => { dashboard = new Dashboard(); });
 </script>

@@ -1,10 +1,29 @@
+# Secrets
 .env
-venv/
+
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# Testing & tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Runtime data
 winston_memory/
 winston_costs.json
-=0.40.0
-.pytest_cache/
-*.egg-info/
+
+# macOS
+.DS_Store
