@@ -83,7 +83,7 @@ ddgs>=9.0
 ## Project Structure
 
 ```
-jarvis/
+winston/
 ├── main.py                      # Winston class — orchestrator, event loop, routing
 ├── config.py                    # All config: models, thresholds, system prompts
 ├── requirements.txt
@@ -392,7 +392,7 @@ FastAPI server on `http://localhost:8420` with WebSocket real-time updates.
 ### 1. Environment
 
 ```bash
-cd jarvis
+cd winston
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -405,7 +405,7 @@ brew install cliclick     # Required for Computer Use (mouse control)
 ### 2. API Keys
 
 ```bash
-# Create .env file in jarvis/
+# Create .env file in winston/
 cat > .env << 'EOF'
 ANTHROPIC_API_KEY=your_anthropic_key_here
 ELEVENLABS_API_KEY=your_elevenlabs_key_here
@@ -426,7 +426,7 @@ System Settings → Privacy & Security:
 ### 4. Run
 
 ```bash
-cd jarvis
+cd winston
 python main.py
 ```
 
@@ -480,6 +480,178 @@ Budget cap: $2.00/day. Scene gating reduces API calls by ~70-80%.
 7. **Graceful degradation.** If the API is overloaded, log a warning and continue. If the daily budget is hit, reduce frequency. Never just stop.
 
 8. **Memory reduces repeated context.** Text summaries from ChromaDB are orders of magnitude cheaper than sending image history. Three-tier memory (working → episodic → semantic) keeps context relevant and affordable.
+
+---
+
+## Latency
+
+The critical path for voice response is:
+
+```
+User stops speaking → Whisper transcription → Intent classification → Claude API call → First TTS audio chunk plays
+```
+
+### Pipeline Stages
+
+| Stage | What happens | Typical latency |
+|-------|-------------|----------------|
+| **STT** | Silence detected → Groq Whisper API transcribes audio | 200–600ms (Groq), 1–3s (local Whisper) |
+| **Intent** | Local heuristic classifies if speech is addressed to Winston | 0–5ms (local), 200–300ms (API fallback) |
+| **Context** | Frame capture + ChromaDB query in parallel (ThreadPoolExecutor) | 50–200ms |
+| **LLM** | Haiku routing with tool-use (non-streaming, includes response) | 300–800ms |
+| **TTS queue** | Response text queued → TTS worker dequeues | 0–500ms (worker polls at 500ms) |
+| **TTS synth** | ElevenLabs `eleven_flash_v2_5` streams first audio chunk | 75–150ms (API spec), 200–400ms (with network) |
+| **End-to-end** | Silence detected → first audio plays through speaker | **750–2350ms** |
+
+### Instrumentation
+
+Latency is tracked via `utils/latency_tracker.py` — a singleton `LatencyTracker` that correlates timing marks across threads using interaction IDs.
+
+**Events tracked:** `speech_end` → `stt_done` → `intent_done` → `context_ready` → `llm_done` → `tts_dequeued` → `audio_plays`
+
+**Log output** (INFO level, every interaction):
+```
+[latency] STT: 340ms
+[latency] LLM first-token: 450ms
+[latency] LLM total: 450ms
+[latency] TTS first-audio: 280ms
+[latency] a1b2c3d4: stt=340ms | intent=3ms | context=120ms | llm=450ms | tts_queue=12ms | tts_synth=280ms | e2e=1205ms
+```
+
+**Dashboard:** System panel shows Last E2E, STT/LLM/TTS p50, and interaction count. REST endpoint: `GET /api/latency` returns full stats (p50, p95, avg, count per segment).
+
+**Stats:** Rolling window of last 100 interactions. `get_stats()` returns p50, p95, avg for each segment.
+
+### Why non-streaming for routing
+
+`process_user_input()` uses Haiku with tool-use, which does not support streaming in the Anthropic API. However, the full response (including Haiku's text reply) arrives in a single non-streaming call, and goes to TTS immediately — no post-processing delay. This is ~300–500ms, comparable to the time it would take to stream the first sentence.
+
+---
+
+## Data Flow: Voice Interaction
+
+A complete voice interaction from microphone to speaker:
+
+```
+Microphone (16kHz mono, sounddevice)
+  │
+  ▼
+AudioListener._audio_callback()              [PortAudio thread]
+  │  Appends float32 chunk to _audio_buffer (deque, lock-free)
+  ▼
+AudioListener._processing_loop()             [audio-processor thread]
+  │  Drains buffer, processes 80ms frames
+  │
+  ├──▶ _al_process_frame()                   [Energy state machine]
+  │    States: idle → accumulating → dispatching → cooldown
+  │    Onset: RMS energy ≥ 0.008
+  │    End: 1.5s silence or 15s max duration
+  │
+  ├──▶ _al_dispatch()                        [Spawns daemon thread]
+  │      ▼
+  │    _al_transcribe_and_classify()          [al-transcribe thread]
+  │      │  Pre-check: skip if avg energy < threshold × 0.5
+  │      │  STT: stt_provider.transcribe(audio)
+  │      │    → GroqWhisperProvider (primary, API)
+  │      │    → LocalWhisperProvider (fallback, on-CPU)
+  │      │  Filters: hallucination set, prompt leak detection, echo rejection
+  │      ▼
+  │    _on_ambient_transcription(text, lang)  [callback → main.py]
+  │      │  Continuation check: skip classification if within 8s window
+  │      │  classify_intent_local(text)
+  │      │    → True:  addressed to Winston → route to _on_transcription
+  │      │    → False: ambient speech → store as observation
+  │      │    → None:  uncertain → API fallback via classify_intent()
+  │      ▼
+  │    _on_transcription(text, lang)          [daemon thread]
+  │      │  camera.get_frame_bytes() + memory.assemble_context()  [parallel]
+  │      │  Build conversation_history (last 10 turns, merged by role)
+  │      ▼
+  │    llm.process_user_input(text, frame, context, lang, history)
+  │      │  Haiku with ROUTING_TOOLS (delegate_to_agent, save_note,
+  │      │  shutdown_system, get_current_time)
+  │      │  Returns (action_type, data)
+  │      │
+  │      ├──▶ "conversation": tts.speak_async(response)
+  │      │      + memory.store() + Thread(extract_facts_from_text)
+  │      ├──▶ "agent": _spawn_agent_task(task)
+  │      │      → Thread "agent-task": AgentExecutor.run()
+  │      │        Opus + tools + Computer Use, max 15 iterations
+  │      │      → On completion: tts.speak_async(summary)
+  │      ├──▶ "note": _notes_store.append_to_list()
+  │      │      + tts.speak_async("Noted: ...")
+  │      └──▶ "shutdown": tts.speak("Going offline") → _running = False
+  │
+  └──▶ _check_bargein(frame)                 [During TTS playback only]
+       EnergyBargeInDetector: calibrates on TTS echo (5 frames),
+       triggers after 3 consecutive frames at 1.5× echo level
+         ▼
+       _handle_bargein()
+         │  Calls on_bargein → streaming_abort.set() + tts.interrupt()
+         │  Records + transcribes interrupted speech
+         └  Echo text rejection: strip_echo_prefix() + echo_text_overlap()
+```
+
+---
+
+## Threading Model
+
+Winston uses a main thread for the event loop plus daemon threads for concurrent I/O. All threads are named for debuggability.
+
+| Thread | Target | Started By | Purpose |
+|--------|--------|------------|---------|
+| `audio-processor` | `AudioListener._processing_loop()` | `audio.start()` | Drains mic buffer, runs always-listen state machine + barge-in |
+| `al-transcribe` | `_al_transcribe_and_classify()` | `_al_dispatch()` | Per-utterance: STT + intent classification |
+| `transcription-handler` | `Winston._on_transcription()` | `_record_and_transcribe()` | Process wake-word/manual-trigger transcriptions |
+| `tts-worker` | `TTSEngine._worker()` | `tts.start()` | Dequeues and plays TTS sentences via sounddevice |
+| `agent-task` | `Winston._run_agent_task()` | `_spawn_agent_task()` | Opus agentic loop (one at a time, guarded by Lock) |
+| `fact-extraction` | `Memory.extract_facts_from_text()` | `_on_transcription()` | Background Haiku call to extract semantic facts |
+| `memory-consolidate` | `Winston._consolidate_memory()` | `Winston.start()` | One-shot startup cleanup of old episodic entries |
+| `dashboard-server` | `uvicorn.run()` | `start_server()` | FastAPI HTTP + WebSocket on port 8420 |
+| `manual-listen` | `AudioListener._handle_wake_word()` | `trigger_listen()` | Dashboard button listen trigger |
+| `shutdown-memory` | `Winston._safe_shutdown_memory()` | `Winston.shutdown()` | Session summary + fact extraction with 3s timeout |
+
+### Thread Communication
+
+| Mechanism | Where Used |
+|-----------|-----------|
+| **Callbacks** | AudioListener fires `on_transcription`, `on_bargein`, `on_ambient_transcription` into daemon threads. Set via `audio.set_callbacks()`. TTS fires `on_speaking_start`/`on_speaking_stop` for barge-in calibration. |
+| **Deque buffers** | `AudioListener._audio_buffer` — lock-free deque with maxlen. Single producer (PortAudio), single consumer (processor thread). |
+| **threading.Lock** | `WinstonState._lock` (all state reads/writes), `Winston._agent_lock` (one agent at a time), `AudioListener._al_active_threads_lock` (concurrent transcription guard). |
+| **threading.Event** | `Winston._streaming_abort` — barge-in cancels in-progress Claude streaming. |
+| **PersistentStore** | Atomic JSON via `tempfile` + `os.replace()` for `agent_tasks.json` and `notes.json`. |
+| **WinstonState.version** | Monotonic counter; WebSocket only pushes when version changes. |
+
+### Concurrency Constraints
+
+1. **One agent at a time**: `Winston._agent_lock` uses non-blocking `acquire()`. A second task gets "I'm still working on the previous task."
+2. **One always-listen transcription at a time**: `_al_active_threads` counter checked before `_al_dispatch()`.
+3. **Barge-in cooldown**: 3s cooldown after false positive (empty transcription from barge-in) to prevent loops.
+4. **Post-TTS cooldown**: 1.5s after TTS stops before always-listen re-enables (avoids echo pickup).
+
+---
+
+## Error Handling Philosophy
+
+Winston runs unattended in a workshop for hours. The core principle: **never crash, always degrade gracefully**.
+
+### Patterns
+
+1. **Retry with backoff**: `ClaudeClient._call_with_retry()` — 2 attempts with exponential backoff (1s, 2s). SDK retries disabled (`max_retries=0`) to avoid double-retry.
+
+2. **Return None on failure**: API methods return `None` on failure. Callers always check: `if response is None: return`. No exceptions propagate to the event loop.
+
+3. **Budget-based frequency reduction**: When daily budget is exceeded, `_capture_interval` increases from 3s to 30s, proactive interval from 30s to 60s. System keeps running at reduced observation frequency.
+
+4. **Rate limit retry in agent**: `AgentExecutor` catches 429 errors, waits 30s, retries once. Sufficient for per-minute token limits on Opus.
+
+5. **Daemon thread exception hook**: `threading.excepthook` logs unhandled exceptions in daemon threads with full tracebacks instead of silently dying.
+
+6. **Graceful shutdown with timeout**: `Winston.shutdown()` runs memory session summary in a thread with `join(timeout=3.0)`. If it hangs, shutdown proceeds.
+
+7. **Module-level isolation**: Each `start()` method (camera, audio, memory, TTS, LLM) can fail independently. Camera failure disables scene analysis but conversation still works.
+
+8. **Agent crash recovery**: On startup, `_check_pending_agent_results()` marks interrupted tasks (status="running" from previous session) as "failed" and reports them.
 
 ---
 
