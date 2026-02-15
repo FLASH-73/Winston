@@ -37,9 +37,18 @@ APPLESCRIPT_KEY_MAP = {
     "end": "end",
     "pageup": "page up",
     "pagedown": "page down",
-    "f1": "f1", "f2": "f2", "f3": "f3", "f4": "f4",
-    "f5": "f5", "f6": "f6", "f7": "f7", "f8": "f8",
-    "f9": "f9", "f10": "f10", "f11": "f11", "f12": "f12",
+    "f1": "f1",
+    "f2": "f2",
+    "f3": "f3",
+    "f4": "f4",
+    "f5": "f5",
+    "f6": "f6",
+    "f7": "f7",
+    "f8": "f8",
+    "f9": "f9",
+    "f10": "f10",
+    "f11": "f11",
+    "f12": "f12",
 }
 
 # Modifier key names → AppleScript modifier syntax
@@ -76,7 +85,9 @@ class MacOSComputerController:
         try:
             result = subprocess.run(
                 ["system_profiler", "SPDisplaysDataType"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             for line in result.stdout.splitlines():
                 line = line.strip()
@@ -90,8 +101,12 @@ class MacOSComputerController:
                     self._scale_y = h / self.display_height
                     logger.info(
                         "Screen: %dx%d native, %dx%d API, scale=%.2fx%.2f",
-                        w, h, self.display_width, self.display_height,
-                        self._scale_x, self._scale_y,
+                        w,
+                        h,
+                        self.display_width,
+                        self.display_height,
+                        self._scale_x,
+                        self._scale_y,
                     )
                     return
         except Exception as e:
@@ -125,14 +140,16 @@ class MacOSComputerController:
 
         result = [{"type": "text", "text": msg}]
         if screenshot_b64:
-            result.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": screenshot_b64,
-                },
-            })
+            result.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": screenshot_b64,
+                    },
+                }
+            )
         return result
 
     def _dispatch(self, action: str, params: dict) -> str:
@@ -213,7 +230,9 @@ class MacOSComputerController:
     def _get_cursor_position(self) -> str:
         result = subprocess.run(
             ["cliclick", "p:."],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         return f"Cursor position: {result.stdout.strip()}"
 
@@ -225,11 +244,7 @@ class MacOSComputerController:
             return "Error: text required"
         # Escape for AppleScript
         safe = text.replace("\\", "\\\\").replace('"', '\\"')
-        script = (
-            'tell application "System Events"\n'
-            f'  keystroke "{safe}"\n'
-            'end tell'
-        )
+        script = f'tell application "System Events"\n  keystroke "{safe}"\nend tell'
         subprocess.run(["osascript", "-e", script], timeout=10)
         return f"Typed: {text[:50]}"
 
@@ -260,43 +275,31 @@ class MacOSComputerController:
                 script = (
                     'tell application "System Events"\n'
                     f'  key code (key code of "{key_name}") using {{{using}}}\n'
-                    'end tell'
+                    "end tell"
                 )
                 # Actually, for named keys with modifiers, use this pattern:
                 script = (
-                    'tell application "System Events"\n'
-                    f'  keystroke (ASCII character 0) using {{{using}}}\n'
-                    'end tell'
+                    f'tell application "System Events"\n  keystroke (ASCII character 0) using {{{using}}}\nend tell'
                 )
                 # Simpler: just use key code approach for special keys
                 script = self._build_key_script(key_part, modifiers)
             else:
-                script = (
-                    'tell application "System Events"\n'
-                    f'  key code {self._get_key_code(key_part)}\n'
-                    'end tell'
-                )
+                script = f'tell application "System Events"\n  key code {self._get_key_code(key_part)}\nend tell'
         elif len(key_part) == 1:
             # Single character
             if modifiers:
                 using = ", ".join(modifiers)
-                script = (
-                    'tell application "System Events"\n'
-                    f'  keystroke "{key_part}" using {{{using}}}\n'
-                    'end tell'
-                )
+                script = f'tell application "System Events"\n  keystroke "{key_part}" using {{{using}}}\nend tell'
             else:
-                script = (
-                    'tell application "System Events"\n'
-                    f'  keystroke "{key_part}"\n'
-                    'end tell'
-                )
+                script = f'tell application "System Events"\n  keystroke "{key_part}"\nend tell'
         else:
             return f"Error: unrecognized key '{key_part}'"
 
         result = subprocess.run(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 0:
             return f"Key press error: {result.stderr.strip()}"
@@ -306,13 +309,33 @@ class MacOSComputerController:
     def _get_key_code(key_name: str) -> int:
         """Get macOS virtual key code for named keys."""
         codes = {
-            "return": 36, "enter": 36, "tab": 48, "escape": 53,
-            "space": 49, "delete": 51, "backspace": 51,
-            "up": 126, "down": 125, "left": 123, "right": 124,
-            "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
-            "f1": 122, "f2": 120, "f3": 99, "f4": 118,
-            "f5": 96, "f6": 97, "f7": 98, "f8": 100,
-            "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+            "return": 36,
+            "enter": 36,
+            "tab": 48,
+            "escape": 53,
+            "space": 49,
+            "delete": 51,
+            "backspace": 51,
+            "up": 126,
+            "down": 125,
+            "left": 123,
+            "right": 124,
+            "home": 115,
+            "end": 119,
+            "pageup": 116,
+            "pagedown": 121,
+            "f1": 122,
+            "f2": 120,
+            "f3": 99,
+            "f4": 118,
+            "f5": 96,
+            "f6": 97,
+            "f7": 98,
+            "f8": 100,
+            "f9": 101,
+            "f10": 109,
+            "f11": 103,
+            "f12": 111,
         }
         return codes.get(key_name.lower(), 36)
 
@@ -321,11 +344,7 @@ class MacOSComputerController:
         """Build AppleScript for pressing a named key with modifiers."""
         code = MacOSComputerController._get_key_code(key_name)
         using = ", ".join(modifiers)
-        return (
-            'tell application "System Events"\n'
-            f'  key code {code} using {{{using}}}\n'
-            'end tell'
-        )
+        return f'tell application "System Events"\n  key code {code} using {{{using}}}\nend tell'
 
     # ── Scroll ───────────────────────────────────────────────────────
 
@@ -346,30 +365,30 @@ class MacOSComputerController:
             delta = amount if direction == "up" else -amount
             script = (
                 'tell application "System Events"\n'
-                f'  repeat {abs(amount)} times\n'
-                f'    scroll {"up" if delta > 0 else "down"}\n'
-                '  end repeat\n'
-                'end tell'
+                f"  repeat {abs(amount)} times\n"
+                f"    scroll {'up' if delta > 0 else 'down'}\n"
+                "  end repeat\n"
+                "end tell"
             )
             # Actually, use key codes for more reliable scrolling
             key_code = 126 if direction == "up" else 125  # arrow up/down
             script = (
                 'tell application "System Events"\n'
-                f'  repeat {amount} times\n'
-                f'    key code {key_code}\n'
-                '    delay 0.05\n'
-                '  end repeat\n'
-                'end tell'
+                f"  repeat {amount} times\n"
+                f"    key code {key_code}\n"
+                "    delay 0.05\n"
+                "  end repeat\n"
+                "end tell"
             )
         elif direction in ("left", "right"):
             key_code = 123 if direction == "left" else 124
             script = (
                 'tell application "System Events"\n'
-                f'  repeat {amount} times\n'
-                f'    key code {key_code}\n'
-                '    delay 0.05\n'
-                '  end repeat\n'
-                'end tell'
+                f"  repeat {amount} times\n"
+                f"    key code {key_code}\n"
+                "    delay 0.05\n"
+                "  end repeat\n"
+                "end tell"
             )
         else:
             return f"Unknown scroll direction: {direction}"
@@ -398,6 +417,7 @@ class MacOSComputerController:
 
             # Save as PNG to buffer
             import io
+
             buf = io.BytesIO()
             img.save(buf, format="PNG", optimize=True)
             return base64.b64encode(buf.getvalue()).decode("utf-8")

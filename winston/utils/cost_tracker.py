@@ -1,13 +1,15 @@
 import json
-import os
 import logging
+import os
 from datetime import date
 from threading import Lock
 
 from config import (
-    MAX_DAILY_COST_USD,
+    AGENT_INPUT_COST_PER_M,
+    AGENT_OUTPUT_COST_PER_M,
     FAST_INPUT_COST_PER_M,
     FAST_OUTPUT_COST_PER_M,
+    MAX_DAILY_COST_USD,
     SMART_INPUT_COST_PER_M,
     SMART_OUTPUT_COST_PER_M,
 )
@@ -46,11 +48,13 @@ class CostTracker:
             "fast_output_tokens": 0,
             "smart_input_tokens": 0,
             "smart_output_tokens": 0,
+            "agent_input_tokens": 0,
+            "agent_output_tokens": 0,
             "total_calls": 0,
         }
 
     def record(self, model: str, input_tokens: int, output_tokens: int) -> None:
-        """Record token usage from an API call. model is 'fast' or 'smart'."""
+        """Record token usage from an API call. model is 'fast', 'smart', or 'agent'."""
         with self._lock:
             # Reset if day has changed
             today = date.today().isoformat()
@@ -83,6 +87,8 @@ class CostTracker:
             + d["fast_output_tokens"] * FAST_OUTPUT_COST_PER_M / 1_000_000
             + d["smart_input_tokens"] * SMART_INPUT_COST_PER_M / 1_000_000
             + d["smart_output_tokens"] * SMART_OUTPUT_COST_PER_M / 1_000_000
+            + d.get("agent_input_tokens", 0) * AGENT_INPUT_COST_PER_M / 1_000_000
+            + d.get("agent_output_tokens", 0) * AGENT_OUTPUT_COST_PER_M / 1_000_000
         )
 
     def get_daily_report(self) -> str:
@@ -95,6 +101,7 @@ class CostTracker:
                 f"Total API calls: {d['total_calls']}\n"
                 f"Haiku tokens:  {d['fast_input_tokens']:,} in / {d['fast_output_tokens']:,} out\n"
                 f"Sonnet tokens: {d['smart_input_tokens']:,} in / {d['smart_output_tokens']:,} out\n"
+                f"Opus tokens:   {d.get('agent_input_tokens', 0):,} in / {d.get('agent_output_tokens', 0):,} out\n"
                 f"Estimated cost: ${cost:.4f} / ${MAX_DAILY_COST_USD:.2f} budget"
             )
 

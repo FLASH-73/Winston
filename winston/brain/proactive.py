@@ -5,13 +5,11 @@ from typing import Optional
 
 import cv2
 import numpy as np
-
 from config import (
-    PROACTIVE_INTERVAL,
     PROACTIVE_COOLDOWN,
-    PROACTIVE_USEFULNESS_THRESHOLD,
-    SYSTEM_PROMPT_PROACTIVE,
+    PROACTIVE_INTERVAL,
     SCENE_CHANGE_THRESHOLD,
+    get_proactive_prompt,
 )
 from utils.frame_diff import compute_scene_change
 
@@ -46,9 +44,7 @@ class ProactiveEngine:
         self._last_check_time = time.time()
 
         # Scene change gate: decode the JPEG to compare with last proactive frame
-        frame_array = cv2.imdecode(
-            np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
-        )
+        frame_array = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame_array is None:
             return None
 
@@ -77,7 +73,7 @@ class ProactiveEngine:
         result = self._llm.analyze_frame(
             frame_bytes,
             prompt=prompt,
-            system_prompt=SYSTEM_PROMPT_PROACTIVE,
+            system_prompt=get_proactive_prompt(),
             use_pro=False,
             max_output_tokens=200,
         )
@@ -95,9 +91,10 @@ class ProactiveEngine:
         usefulness = result.get("usefulness_score", 0)
         message = result.get("message", "")
 
-        if not should_speak or usefulness < PROACTIVE_USEFULNESS_THRESHOLD:
-            logger.debug("Proactive check: not speaking (score=%d, should_speak=%s)",
-                         usefulness, should_speak)
+        from personality import get_personality
+
+        if not should_speak or usefulness < get_personality().proactive_threshold:
+            logger.debug("Proactive check: not speaking (score=%d, should_speak=%s)", usefulness, should_speak)
             return None
 
         if not self._cooldown_passed():

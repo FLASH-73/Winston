@@ -3,7 +3,8 @@
 Tests your API key, model, and response format independently of WINSTON.
 Verifies that text responses come back reliably.
 """
-from config import ANTHROPIC_API_KEY, FAST_MODEL, SMART_MODEL, SYSTEM_PROMPT_CONVERSATION
+
+from config import ANTHROPIC_API_KEY, FAST_MODEL, SMART_MODEL, get_conversation_prompt
 
 print(f"API key: {ANTHROPIC_API_KEY[:12]}...{ANTHROPIC_API_KEY[-4:]}" if ANTHROPIC_API_KEY else "API key: NOT SET!")
 print(f"Fast model: {FAST_MODEL}")
@@ -12,6 +13,7 @@ print()
 
 try:
     import anthropic
+
     print(f"anthropic SDK version: {anthropic.__version__}")
 except ImportError:
     print("ERROR: anthropic package not installed. Run: pip install anthropic")
@@ -26,7 +28,9 @@ def dump_response(response, label=""):
         print(f"  [{label}]")
     if response.content:
         for i, block in enumerate(response.content):
-            print(f"  content[{i}]: type={block.type}, text={repr(block.text[:80]) if hasattr(block, 'text') and block.text else 'N/A'}")
+            print(
+                f"  content[{i}]: type={block.type}, text={repr(block.text[:80]) if hasattr(block, 'text') and block.text else 'N/A'}"
+            )
     else:
         print("  NO CONTENT BLOCKS!")
     print(f"  stop_reason: {response.stop_reason}")
@@ -58,7 +62,7 @@ try:
     response2 = client.messages.create(
         model=FAST_MODEL,
         max_tokens=100,
-        system=SYSTEM_PROMPT_CONVERSATION,
+        system=get_conversation_prompt(),
         messages=[{"role": "user", "content": "Hey Winston, what can you do?"}],
     )
     dump_response(response2, "Fast + system prompt")

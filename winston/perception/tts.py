@@ -1,8 +1,8 @@
 import logging
-import time
 import threading
+import time
 from abc import ABC, abstractmethod
-from queue import Queue, Empty
+from queue import Empty, Queue
 from typing import Callable, Optional
 
 import numpy as np
@@ -15,16 +15,13 @@ class TTSBackend(ABC):
     """Abstract interface for a TTS backend."""
 
     @abstractmethod
-    def initialize(self) -> bool:
-        ...
+    def initialize(self) -> bool: ...
 
     @abstractmethod
-    def synthesize_and_play(self, text: str, on_playback_start: Optional[Callable] = None) -> None:
-        ...
+    def synthesize_and_play(self, text: str, on_playback_start: Optional[Callable] = None) -> None: ...
 
     @abstractmethod
-    def shutdown(self) -> None:
-        ...
+    def shutdown(self) -> None: ...
 
 
 class ElevenLabsBackend(TTSBackend):
@@ -44,33 +41,30 @@ class ElevenLabsBackend(TTSBackend):
 
     def initialize(self) -> bool:
         try:
-            from elevenlabs.client import ElevenLabs
             from config import (
                 ELEVENLABS_API_KEY,
-                ELEVENLABS_VOICE_ID,
                 ELEVENLABS_MODEL,
                 ELEVENLABS_OUTPUT_FORMAT,
                 ELEVENLABS_SAMPLE_RATE,
-                ELEVENLABS_VOICE_STABILITY,
-                ELEVENLABS_VOICE_SIMILARITY,
-                ELEVENLABS_VOICE_STYLE,
             )
+            from elevenlabs.client import ElevenLabs
+            from personality import get_personality
 
             if not ELEVENLABS_API_KEY or ELEVENLABS_API_KEY == "your_elevenlabs_key_here":
                 logger.info("ELEVENLABS_API_KEY not set")
                 return False
 
+            p = get_personality()
             self._client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-            self._voice_id = ELEVENLABS_VOICE_ID
+            self._voice_id = p.voice.voice_id
             self._model_id = ELEVENLABS_MODEL
             self._output_format = ELEVENLABS_OUTPUT_FORMAT
             self._sample_rate = ELEVENLABS_SAMPLE_RATE
-            self._stability = ELEVENLABS_VOICE_STABILITY
-            self._similarity = ELEVENLABS_VOICE_SIMILARITY
-            self._style = ELEVENLABS_VOICE_STYLE
+            self._stability = p.voice.stability
+            self._similarity = p.voice.similarity
+            self._style = p.voice.style
 
-            logger.info("ElevenLabs backend initialized (voice=%s, model=%s)",
-                        self._voice_id, self._model_id)
+            logger.info("ElevenLabs backend initialized (voice=%s, model=%s)", self._voice_id, self._model_id)
             return True
 
         except ImportError:
@@ -175,6 +169,7 @@ class Pyttsx3Backend(TTSBackend):
     def initialize(self) -> bool:
         try:
             import pyttsx3
+
             try:
                 self._engine = pyttsx3.init("nsss")  # macOS NSSpeechSynthesizer
             except Exception:
@@ -273,14 +268,14 @@ class TTSEngine:
         if not text or not text.strip():
             return
         done_event = threading.Event()
-        self._queue.put((text, done_event))
+        self._queue.put((text, done_event, None))
         done_event.wait(timeout=30)
 
-    def speak_async(self, text: str) -> None:
+    def speak_async(self, text: str, interaction_id: str = None) -> None:
         """Queue text for async speech (non-blocking)."""
         if not text or not text.strip():
             return
-        self._queue.put((text, None))
+        self._queue.put((text, None, interaction_id))
 
     @property
     def is_speaking(self) -> bool:
@@ -325,7 +320,7 @@ class TTSEngine:
         The worker will fire _on_speaking_stop when it processes the marker.
         """
         self._streaming_response_active = False
-        self._queue.put(("__RESPONSE_BOUNDARY__", None))
+        self._queue.put(("__RESPONSE_BOUNDARY__", None, None))
 
     def interrupt(self) -> None:
         """Interrupt current speech immediately. Safe to call from any thread."""
@@ -352,7 +347,7 @@ class TTSEngine:
             try:
                 item = self._queue.get_nowait()
                 if item is not None:
-                    _, done_event = item
+                    _, done_event, _ = item
                     if done_event is not None:
                         done_event.set()
             except Empty:
@@ -398,12 +393,16 @@ class TTSEngine:
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
                 response_accumulator = ""
-                text_item, done_ev = item
+                text_item, done_ev, iid = item
                 if done_ev is not None:
                     done_ev.set()
+                if iid:
+                    from utils.latency_tracker import LatencyTracker
+
+                    LatencyTracker.get().discard(iid)
                 continue
 
-            text, done_event = item
+            text, done_event, interaction_id = item
 
             # Handle response boundary marker (end of streaming response)
             if text == "__RESPONSE_BOUNDARY__":
@@ -419,6 +418,13 @@ class TTSEngine:
                     done_event.set()
                 continue
 
+            # Mark TTS dequeue for latency tracking
+            if interaction_id:
+                from utils.latency_tracker import LatencyTracker
+
+                tracker = LatencyTracker.get()
+                tracker.mark(interaction_id, "tts_dequeued")
+
             try:
                 # Accumulate for echo cancellation (sentences → full response)
                 response_accumulator = (response_accumulator + " " + text).strip()
@@ -431,9 +437,22 @@ class TTSEngine:
 
                 # _on_speaking_start is deferred to on_playback_start callback
                 # so it fires AFTER HTTP download, right before sd.play()
+                _iid = interaction_id  # capture for closure
+
                 def _notify_playback_start():
                     with self._is_speaking_lock:
                         self._speaking_start_time = time.monotonic()
+
+                    # Mark audio playback start and finish latency trace
+                    if _iid:
+                        from utils.latency_tracker import LatencyTracker
+
+                        _tracker = LatencyTracker.get()
+                        _tracker.mark(_iid, "audio_plays")
+                        summary = _tracker.finish(_iid)
+                        if summary and "tts_synth" in summary:
+                            logger.info("[latency] TTS first-audio: %dms", summary["tts_synth"])
+
                     if self._on_speaking_start:
                         try:
                             self._on_speaking_start()
@@ -443,6 +462,10 @@ class TTSEngine:
                 self._speak_with_fallback(text, on_playback_start=_notify_playback_start)
             except Exception as e:
                 logger.error("TTS error: %s", e)
+                if interaction_id:
+                    from utils.latency_tracker import LatencyTracker
+
+                    LatencyTracker.get().discard(interaction_id)
             finally:
                 if not self._streaming_response_active:
                     # Standalone utterance or last sentence — fire stop

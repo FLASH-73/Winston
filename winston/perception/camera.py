@@ -1,15 +1,14 @@
-import contextlib
-import cv2
 import logging
 import os
 import platform
 import subprocess
-import numpy as np
 from collections import deque
 from threading import Lock
 from typing import Optional
 
-from config import CAMERA_INDEX, CAMERA_SOURCE, FRAME_RESOLUTION, SCENE_CHANGE_THRESHOLD
+import cv2
+import numpy as np
+from config import CAMERA_INDEX, FRAME_RESOLUTION, SCENE_CHANGE_THRESHOLD
 from utils.frame_diff import compute_scene_change
 
 logger = logging.getLogger("winston.camera")
@@ -26,7 +25,9 @@ def _get_camera_names() -> list[str]:
     try:
         result = subprocess.run(
             ["system_profiler", "SPCameraDataType"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         names = []
         for line in result.stdout.splitlines():
@@ -70,10 +71,17 @@ def list_cameras(max_index: int = 10) -> list[dict]:
                 channels = 0
                 cam_type = "Unknown"
 
-            cameras.append({
-                "index": i, "name": name, "width": w, "height": h,
-                "backend": backend, "channels": channels, "type": cam_type,
-            })
+            cameras.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "width": w,
+                    "height": h,
+                    "backend": backend,
+                    "channels": channels,
+                    "type": cam_type,
+                }
+            )
             cap.release()
         else:
             cap.release()
@@ -101,14 +109,21 @@ def select_camera() -> int:
 
     if len(cameras) == 1:
         cam = cameras[0]
-        logger.info("One camera found: %s (%s, index %d, %dx%d)",
-                     cam["name"], cam["type"], cam["index"], cam["width"], cam["height"])
+        logger.info(
+            "One camera found: %s (%s, index %d, %dx%d)",
+            cam["name"],
+            cam["type"],
+            cam["index"],
+            cam["width"],
+            cam["height"],
+        )
         return cam["index"]
 
     if color_cameras and len(color_cameras) == 1:
         cam = color_cameras[0]
-        logger.info("Auto-selected color camera: %s (index %d, %dx%d)",
-                     cam["name"], cam["index"], cam["width"], cam["height"])
+        logger.info(
+            "Auto-selected color camera: %s (index %d, %dx%d)", cam["name"], cam["index"], cam["width"], cam["height"]
+        )
         return cam["index"]
 
     print("\n  Available cameras:")

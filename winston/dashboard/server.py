@@ -1,24 +1,27 @@
 """FastAPI server for the WINSTON web dashboard.
 
 Endpoints:
-  GET  /                  — Dashboard HTML
-  GET  /camera/stream     — MJPEG live camera feed
-  WS   /ws                — Real-time state via WebSocket
-  GET  /api/facts         — Memory facts (on-demand)
-  GET  /api/cost          — Cost report details
+  GET  /                        — Dashboard HTML
+  GET  /camera/stream           — MJPEG live camera feed
+  GET  /api/camera/frame        — Single JPEG snapshot
+  WS   /ws                      — Real-time state via WebSocket
+  GET  /api/facts               — Memory facts (text)
+  GET  /api/facts/structured    — Memory facts (JSON with categories)
+  GET  /api/cost                — Cost report details
+  GET  /api/latency             — Latency tracking stats (p50/p95/avg)
+  POST /api/notes               — Create a note from the dashboard
 """
 
 import asyncio
 import json
 import logging
-import os
 import threading
-import time
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger("winston.dashboard")
 
@@ -85,21 +88,29 @@ async def index():
 @app.get("/camera/stream")
 async def camera_stream():
     """MJPEG stream from the camera at ~10 FPS."""
+
     async def generate():
         while True:
             if _camera is not None and _camera.is_open:
                 frame_bytes = _camera.get_frame_bytes(quality=50)
                 if frame_bytes:
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-                    )
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
             await asyncio.sleep(0.1)
 
     return StreamingResponse(
         generate(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/api/camera/frame")
+async def camera_frame():
+    """Return a single JPEG frame from the camera."""
+    if _camera is not None and _camera.is_open:
+        frame_bytes = _camera.get_frame_bytes(quality=70)
+        if frame_bytes:
+            return Response(content=frame_bytes, media_type="image/jpeg")
+    return Response(content=b"", status_code=503)
 
 
 @app.websocket("/ws")
@@ -121,10 +132,14 @@ async def websocket_endpoint(ws: WebSocket):
                 last_version = current_version
             else:
                 # Still send audio level updates (not version-tracked)
-                await ws.send_text(json.dumps({
-                    "type": "audio",
-                    "data": {"audioLevel": _state.audio_level},
-                }))
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "audio",
+                            "data": {"audioLevel": _state.audio_level},
+                        }
+                    )
+                )
 
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
@@ -145,15 +160,29 @@ async def get_facts():
     return JSONResponse({"facts": "No facts stored yet."})
 
 
+@app.get("/api/facts/structured")
+async def get_facts_structured():
+    """Return semantic memory facts as structured JSON with categories."""
+    if _memory is not None:
+        try:
+            facts = list(_memory.semantic._facts)
+            return JSONResponse({"facts": facts})
+        except Exception:
+            pass
+    return JSONResponse({"facts": []})
+
+
 @app.get("/api/cost")
 async def get_cost():
     """Return cost tracker report."""
     if _cost_tracker is not None:
         try:
-            return JSONResponse({
-                "report": _cost_tracker.get_daily_report(),
-                "cost": _cost_tracker.get_daily_cost(),
-            })
+            return JSONResponse(
+                {
+                    "report": _cost_tracker.get_daily_report(),
+                    "cost": _cost_tracker.get_daily_cost(),
+                }
+            )
         except Exception:
             pass
     return JSONResponse({"report": "No cost data.", "cost": 0.0})
@@ -166,9 +195,11 @@ async def toggle_note(note_id: str):
         return JSONResponse({"status": "error"}, status_code=503)
     found = _state.toggle_note(note_id)
     if found and _notes_store is not None:
-        _notes_store.update_in_list("notes", note_id, {"done": next(
-            (n.get("done", False) for n in _state.notes if n.get("id") == note_id), False
-        )})
+        _notes_store.update_in_list(
+            "notes",
+            note_id,
+            {"done": next((n.get("done", False) for n in _state.notes if n.get("id") == note_id), False)},
+        )
     return JSONResponse({"status": "ok" if found else "not_found"})
 
 
@@ -181,6 +212,39 @@ async def delete_note(note_id: str):
     if found and _notes_store is not None:
         _notes_store.remove_from_list("notes", note_id)
     return JSONResponse({"status": "ok" if found else "not_found"})
+
+
+@app.post("/api/notes")
+async def create_note(request: Request):
+    """Create a new note from the dashboard."""
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        return JSONResponse({"status": "error", "message": "Note text required"}, status_code=400)
+    note = {
+        "id": str(uuid.uuid4()),
+        "text": text,
+        "created_at": datetime.now().isoformat(),
+        "source": "dashboard",
+        "done": False,
+    }
+    if _notes_store is not None:
+        _notes_store.append_to_list("notes", note, max_items=100)
+    if _state is not None:
+        _state.add_note(note)
+    return JSONResponse({"status": "ok", "note": note})
+
+
+@app.get("/api/latency")
+async def get_latency():
+    """Return latency tracking stats (p50, p95, avg per segment)."""
+    try:
+        from utils.latency_tracker import LatencyTracker
+
+        stats = LatencyTracker.get().get_stats()
+        return JSONResponse(stats)
+    except Exception:
+        return JSONResponse({})
 
 
 @app.post("/api/listen")

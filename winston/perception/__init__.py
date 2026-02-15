@@ -1,3 +1,3 @@
-from .camera import Camera
-from .audio import AudioListener
-from .tts import TTSEngine
+from .audio import AudioListener as AudioListener
+from .camera import Camera as Camera
+from .tts import TTSEngine as TTSEngine

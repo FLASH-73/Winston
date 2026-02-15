@@ -1,3 +1,3 @@
-from .claude_client import ClaudeClient
-from .memory import Memory
-from .proactive import ProactiveEngine
+from .claude_client import ClaudeClient as ClaudeClient
+from .memory import Memory as Memory
+from .proactive import ProactiveEngine as ProactiveEngine

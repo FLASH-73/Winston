@@ -27,28 +27,28 @@ import tempfile
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     import chromadb
 
 from config import (
-    MEMORY_DB_PATH,
-    MEMORY_EPISODES_COLLECTION,
-    MEMORY_SUMMARIES_COLLECTION,
-    MEMORY_SEMANTIC_COLLECTION,
-    MEMORY_USER_PROFILE_FILE,
-    MEMORY_DEDUP_THRESHOLD,
-    MEMORY_DEDUP_WINDOW_SECONDS,
     MEMORY_CONSOLIDATE_AFTER_DAYS,
     MEMORY_CONSOLIDATE_MIN_IMPORTANCE,
     MEMORY_CONTEXT_BUDGET_CONVERSATION,
     MEMORY_CONTEXT_BUDGET_PROACTIVE,
-    WORKING_MEMORY_MAX_OBSERVATIONS,
-    WORKING_MEMORY_MAX_CONVERSATIONS,
+    MEMORY_DB_PATH,
+    MEMORY_DEDUP_THRESHOLD,
+    MEMORY_DEDUP_WINDOW_SECONDS,
+    MEMORY_EPISODES_COLLECTION,
+    MEMORY_SEMANTIC_COLLECTION,
+    MEMORY_SUMMARIES_COLLECTION,
+    MEMORY_USER_PROFILE_FILE,
     SYSTEM_PROMPT_FACT_EXTRACTION,
     SYSTEM_PROMPT_SESSION_SUMMARY,
+    WORKING_MEMORY_MAX_CONVERSATIONS,
+    WORKING_MEMORY_MAX_OBSERVATIONS,
 )
 
 logger = logging.getLogger("winston.memory")
@@ -57,6 +57,7 @@ logger = logging.getLogger("winston.memory")
 # ---------------------------------------------------------------------------
 # Tier 1: Working Memory (in-process, ephemeral)
 # ---------------------------------------------------------------------------
+
 
 class WorkingMemory:
     """Fast, in-process memory for the current session. No DB or API calls."""
@@ -69,32 +70,43 @@ class WorkingMemory:
         self._max_conversations = WORKING_MEMORY_MAX_CONVERSATIONS
 
     def add_observation(self, text: str, activity: str = "") -> None:
-        self.observations.append({
-            "text": text,
-            "activity": activity,
-            "timestamp": datetime.now().isoformat(),
-        })
+        """Record a scene observation with timestamp."""
+        self.observations.append(
+            {
+                "text": text,
+                "activity": activity,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
     def add_conversation(self, question: str, answer: str) -> None:
-        self.conversations.append({
-            "question": question,
-            "answer": answer,
-            "timestamp": datetime.now().isoformat(),
-        })
+        """Record a Q/A exchange. Bounded to last N turns."""
+        self.conversations.append(
+            {
+                "question": question,
+                "answer": answer,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
         # Keep bounded
         if len(self.conversations) > self._max_conversations:
-            self.conversations = self.conversations[-self._max_conversations:]
+            self.conversations = self.conversations[-self._max_conversations :]
 
     def add_proactive(self, message: str) -> None:
-        self.proactive_spoken.append({
-            "message": message,
-            "timestamp": datetime.now().isoformat(),
-        })
+        """Record a proactive comment Winston made."""
+        self.proactive_spoken.append(
+            {
+                "message": message,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
 
     def get_recent_observations(self, n: int = 5) -> list[str]:
+        """Return the text of the last N observations."""
         return [o["text"] for o in list(self.observations)[-n:]]
 
     def get_conversation_context(self) -> str:
+        """Format recent conversation turns as readable text."""
         if not self.conversations:
             return ""
         lines = []
@@ -140,29 +152,35 @@ class WorkingMemory:
 # Tier 2: Episodic Memory (ChromaDB — persistent across sessions)
 # ---------------------------------------------------------------------------
 
+
 class EpisodicMemory:
     """Persistent memory for observations and conversations with importance scoring."""
 
     # Keyword patterns for importance scoring
     _SAFETY_KEYWORDS = re.compile(
         r"safety|danger|warning|careful|hot|burn|sharp|eye protection|glasses|fire|shock|"
-        r"soldering iron left|unplug|hazard", re.IGNORECASE
+        r"soldering iron left|unplug|hazard",
+        re.IGNORECASE,
     )
     _MEASUREMENT_KEYWORDS = re.compile(
         r"\d+\s*(mm|cm|m|inch|V|mV|A|mA|ohm|kg|g|lb|rpm|Hz|kHz|MHz|"
-        r"degrees|°|N[·.]?m|torque)", re.IGNORECASE
+        r"degrees|°|N[·.]?m|torque)",
+        re.IGNORECASE,
     )
     _MILESTONE_KEYWORDS = re.compile(
         r"fixed|solved|completed|finished|works now|success|done|resolved|"
-        r"assembled|printed|calibrated", re.IGNORECASE
+        r"assembled|printed|calibrated",
+        re.IGNORECASE,
     )
     _PREFERENCE_KEYWORDS = re.compile(
         r"prefer|decided|switched to|always use|better with|I like|I use|"
-        r"my go-to|I usually", re.IGNORECASE
+        r"my go-to|I usually",
+        re.IGNORECASE,
     )
     _CORRECTION_KEYWORDS = re.compile(
         r"wrong|mistake|should have|shouldn't|correct way|actually|"
-        r"not that|the other|I meant", re.IGNORECASE
+        r"not that|the other|I meant",
+        re.IGNORECASE,
     )
 
     def __init__(self):
@@ -176,8 +194,7 @@ class EpisodicMemory:
         self._client = client
         self._episodes = client.get_or_create_collection(name=MEMORY_EPISODES_COLLECTION)
         self._summaries = client.get_or_create_collection(name=MEMORY_SUMMARIES_COLLECTION)
-        logger.info("Episodic memory: %d episodes, %d summaries",
-                     self._episodes.count(), self._summaries.count())
+        logger.info("Episodic memory: %d episodes, %d summaries", self._episodes.count(), self._summaries.count())
 
     def store(self, text: str, entry_type: str = "observation", activity: str = "") -> None:
         """Store an entry with auto-computed importance. Skips duplicates."""
@@ -351,16 +368,14 @@ class EpisodicMemory:
                 sid = meta.get("session_id", "")
 
                 # Only delete if: old enough, session is summarized, low importance
-                if (ts < cutoff
-                        and sid in summarized_sessions
-                        and imp < MEMORY_CONSOLIDATE_MIN_IMPORTANCE):
+                if ts < cutoff and sid in summarized_sessions and imp < MEMORY_CONSOLIDATE_MIN_IMPORTANCE:
                     ids_to_delete.append(doc_id)
 
             if ids_to_delete:
                 # ChromaDB delete in batches
                 batch_size = 100
                 for i in range(0, len(ids_to_delete), batch_size):
-                    batch = ids_to_delete[i:i + batch_size]
+                    batch = ids_to_delete[i : i + batch_size]
                     self._episodes.delete(ids=batch)
                 deleted = len(ids_to_delete)
                 logger.info("Consolidated %d old low-importance entries", deleted)
@@ -410,8 +425,12 @@ class EpisodicMemory:
                 n_results=1,
                 include=["metadatas", "distances"],
             )
-            if (results and results["distances"] and results["distances"][0]
-                    and results["distances"][0][0] < MEMORY_DEDUP_THRESHOLD):
+            if (
+                results
+                and results["distances"]
+                and results["distances"][0]
+                and results["distances"][0][0] < MEMORY_DEDUP_THRESHOLD
+            ):
                 # Check if within time window
                 meta = results["metadatas"][0][0]
                 ts = meta.get("timestamp_unix", 0)
@@ -426,6 +445,7 @@ class EpisodicMemory:
 # Tier 3: Semantic Memory (JSON + ChromaDB — learned facts about Roberto)
 # ---------------------------------------------------------------------------
 
+
 class SemanticMemory:
     """Persistent facts about the user, extracted from conversations."""
 
@@ -436,9 +456,7 @@ class SemanticMemory:
 
     def initialize(self, client: chromadb.ClientAPI, db_path: str) -> None:
         self._profile_path = os.path.join(db_path, MEMORY_USER_PROFILE_FILE)
-        self._chromadb_collection = client.get_or_create_collection(
-            name=MEMORY_SEMANTIC_COLLECTION
-        )
+        self._chromadb_collection = client.get_or_create_collection(name=MEMORY_SEMANTIC_COLLECTION)
         self._load_profile()
         logger.info("Semantic memory: %d facts loaded", len(self._facts))
 
@@ -470,8 +488,9 @@ class SemanticMemory:
         except Exception as e:
             logger.error("Failed to save user profile: %s", e)
 
-    def add_fact(self, entity: str, attribute: str, value: str,
-                 confidence: float = 0.8, category: str = "personal") -> None:
+    def add_fact(
+        self, entity: str, attribute: str, value: str, confidence: float = 0.8, category: str = "personal"
+    ) -> None:
         """Add or update a fact. Deduplicates by entity+attribute."""
         # Check for existing fact with same entity+attribute
         for fact in self._facts:
@@ -558,6 +577,7 @@ class SemanticMemory:
 
     @property
     def fact_count(self) -> int:
+        """Number of structured facts in the JSON profile."""
         return len(self._facts)
 
     def _fact_id(self, fact: dict) -> str:
@@ -588,6 +608,7 @@ class SemanticMemory:
 # Memory Facade (backward-compatible interface)
 # ---------------------------------------------------------------------------
 
+
 class Memory:
     """Main memory interface — routes to the three tiers.
 
@@ -608,12 +629,14 @@ class Memory:
     def start(self) -> bool:
         """Initialize all memory tiers."""
         import chromadb
+
         try:
             self._client = chromadb.PersistentClient(path=MEMORY_DB_PATH)
             self.episodic.initialize(self._client)
             self.semantic.initialize(self._client, MEMORY_DB_PATH)
-            logger.info("Memory system online — %d episodes, %d facts",
-                        self.episodic.episode_count, self.semantic.fact_count)
+            logger.info(
+                "Memory system online — %d episodes, %d facts", self.episodic.episode_count, self.semantic.fact_count
+            )
             return True
         except Exception as e:
             logger.error("Failed to initialize memory system: %s", e)
@@ -621,8 +644,9 @@ class Memory:
 
     # ------ Backward-compatible interface ------
 
-    def store(self, text: str, entry_type: str = "observation",
-              activity: str = "", metadata: Optional[dict] = None) -> None:
+    def store(
+        self, text: str, entry_type: str = "observation", activity: str = "", metadata: Optional[dict] = None
+    ) -> None:
         """Store to both working memory and episodic memory."""
         if entry_type == "observation":
             self.working.add_observation(text, activity)
@@ -648,6 +672,7 @@ class Memory:
 
     @property
     def entry_count(self) -> int:
+        """Total episodic memory entries in ChromaDB."""
         return self.episodic.episode_count
 
     def get_session_summary(self) -> str:
@@ -666,9 +691,7 @@ class Memory:
         Returns:
             A formatted context string ready to include in prompts.
         """
-        budget = (MEMORY_CONTEXT_BUDGET_CONVERSATION
-                  if purpose == "conversation"
-                  else MEMORY_CONTEXT_BUDGET_PROACTIVE)
+        budget = MEMORY_CONTEXT_BUDGET_CONVERSATION if purpose == "conversation" else MEMORY_CONTEXT_BUDGET_PROACTIVE
 
         sections = []
         tokens_used = 0
@@ -696,7 +719,6 @@ class Memory:
         if query and tokens_used < budget:
             memories = self.episodic.recall(query, n_results=5)
             if memories:
-                remaining_budget = budget - tokens_used
                 mem_lines = []
                 for mem in memories:
                     line = f"- {mem}"
@@ -763,8 +785,11 @@ class Memory:
         # Extract any remaining facts from the full session
         self.extract_facts_from_text(session_text, llm_client)
 
-        logger.info("Session shutdown complete — %d episodes, %d facts total",
-                     self.episodic.episode_count, self.semantic.fact_count)
+        logger.info(
+            "Session shutdown complete — %d episodes, %d facts total",
+            self.episodic.episode_count,
+            self.semantic.fact_count,
+        )
 
     def consolidate(self) -> int:
         """Clean up old, low-importance entries. Run at startup in background."""

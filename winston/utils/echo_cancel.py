@@ -9,7 +9,6 @@ User speaking over TTS → energy spike above that level.
 """
 
 import logging
-import time
 
 import numpy as np
 
@@ -77,7 +76,7 @@ class EnergyBargeInDetector:
         if not self._active:
             return False
 
-        energy = float(np.sqrt(np.mean(mic_frame ** 2)))
+        energy = float(np.sqrt(np.mean(mic_frame**2)))
 
         if self._calibrating:
             # Measure TTS echo level during calibration
@@ -92,7 +91,8 @@ class EnergyBargeInDetector:
                 )
                 logger.info(
                     "Barge-in ready: echo_peak=%.4f, threshold=%.4f",
-                    self._peak_energy, self._threshold,
+                    self._peak_energy,
+                    self._threshold,
                 )
             return False
 
@@ -102,8 +102,10 @@ class EnergyBargeInDetector:
             if self._consecutive_above <= self._consecutive_trigger + 2:
                 logger.debug(
                     "Barge-in energy: %.4f > %.4f (%d/%d)",
-                    energy, self._threshold,
-                    self._consecutive_above, self._consecutive_trigger,
+                    energy,
+                    self._threshold,
+                    self._consecutive_above,
+                    self._consecutive_trigger,
                 )
         else:
             self._consecutive_above = 0  # Hard reset — no slow decay
@@ -111,7 +113,8 @@ class EnergyBargeInDetector:
         if self._consecutive_above >= self._consecutive_trigger:
             logger.info(
                 "BARGE-IN TRIGGERED (energy=%.4f, threshold=%.4f, ratio=%.1fx)",
-                energy, self._threshold,
+                energy,
+                self._threshold,
                 energy / max(self._threshold, 1e-8),
             )
             self._consecutive_above = 0
@@ -167,7 +170,9 @@ def strip_echo_prefix(transcription: str, tts_text: str) -> str:
     if result:
         logger.info(
             "Echo prefix stripped (%d words): '%s' -> '%s'",
-            strip_count, transcription, result,
+            strip_count,
+            transcription,
+            result,
         )
 
     return result
