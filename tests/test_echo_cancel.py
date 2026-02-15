@@ -87,6 +87,49 @@ class TestEnergyBargeInDetector:
         for _ in range(5):
             assert detector.process(below_floor) is False
 
+    def test_calibration_sets_threshold_from_mean(self):
+        detector = EnergyBargeInDetector(
+            threshold_factor=2.0,
+            calibration_frames=3,
+            min_energy=0.01,
+        )
+        detector.start_calibration()
+
+        # Feed 3 frames with different energies: 0.04, 0.06, 0.05
+        # Mean = 0.05, threshold = 0.05 * 2.0 = 0.10
+        detector.process(np.ones(1280, dtype=np.float32) * 0.04)
+        detector.process(np.ones(1280, dtype=np.float32) * 0.06)
+        detector.process(np.ones(1280, dtype=np.float32) * 0.05)
+
+        assert not detector.is_calibrating
+        assert abs(detector.threshold - 0.10) < 0.01
+
+    def test_threshold_respects_min_energy(self):
+        detector = EnergyBargeInDetector(
+            threshold_factor=2.0,
+            calibration_frames=2,
+            min_energy=0.05,
+        )
+        detector.start_calibration()
+
+        # Very quiet echo: mean=0.01, threshold would be 0.02 but floor is 0.05
+        detector.process(np.ones(1280, dtype=np.float32) * 0.01)
+        detector.process(np.ones(1280, dtype=np.float32) * 0.01)
+
+        assert detector.threshold >= 0.05
+
+    def test_no_trigger_during_calibration(self):
+        detector = EnergyBargeInDetector(
+            calibration_frames=5,
+            consecutive_trigger=1,
+            min_energy=0.001,
+        )
+        detector.start_calibration()
+
+        # Even very loud frames during calibration should NOT trigger
+        for _ in range(5):
+            assert detector.process(np.ones(1280, dtype=np.float32) * 0.5) is False
+
     def test_reset_deactivates(self):
         detector = EnergyBargeInDetector()
         detector.start_calibration()

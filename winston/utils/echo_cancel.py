@@ -44,7 +44,7 @@ class EnergyBargeInDetector:
         self._active: bool = False
         self._calibrating: bool = False
         self._frames_seen: int = 0
-        self._peak_energy: float = 0.0
+        self._energy_samples: list[float] = []
         self._threshold: float = 0.0
         self._consecutive_above: int = 0
 
@@ -53,7 +53,7 @@ class EnergyBargeInDetector:
         self._calibrating = True
         self._active = True
         self._frames_seen = 0
-        self._peak_energy = 0.0
+        self._energy_samples = []
         self._threshold = 0.0
         self._consecutive_above = 0
 
@@ -71,6 +71,10 @@ class EnergyBargeInDetector:
     def is_calibrating(self) -> bool:
         return self._calibrating
 
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
     def process(self, mic_frame: np.ndarray) -> bool:
         """Process a mic frame. Returns True if barge-in should trigger."""
         if not self._active:
@@ -80,19 +84,21 @@ class EnergyBargeInDetector:
 
         if self._calibrating:
             # Measure TTS echo level during calibration
-            self._peak_energy = max(self._peak_energy, energy)
+            self._energy_samples.append(energy)
             self._frames_seen += 1
             if self._frames_seen >= self._calibration_count:
                 self._calibrating = False
-                # Threshold = 2x echo peak, but at least min_energy
+                # Use mean echo energy (more stable than peak)
+                avg_energy = sum(self._energy_samples) / len(self._energy_samples) if self._energy_samples else 0.0
                 self._threshold = max(
-                    self._peak_energy * self._threshold_factor,
+                    avg_energy * self._threshold_factor,
                     self._min_energy,
                 )
                 logger.info(
-                    "Barge-in ready: echo_peak=%.4f, threshold=%.4f",
-                    self._peak_energy,
+                    "Barge-in ready: echo_avg=%.4f, threshold=%.4f (factor=%.1f)",
+                    avg_energy,
                     self._threshold,
+                    self._threshold_factor,
                 )
             return False
 
