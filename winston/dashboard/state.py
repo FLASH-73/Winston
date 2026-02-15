@@ -28,6 +28,7 @@ class WinstonState:
         self.cost_today = 0.0
         self.budget_max = 2.0
         self.always_listen_state = "disabled"
+        self.music_mode = False
 
         # Content
         self.conversation = []  # [{"role": str, "text": str, "timestamp": str}]
@@ -88,6 +89,13 @@ class WinstonState:
         with self._lock:
             if self.always_listen_state != state:
                 self.always_listen_state = state
+                self._version += 1
+
+    def set_music_mode(self, enabled: bool):
+        """Update music mode status."""
+        with self._lock:
+            if self.music_mode != enabled:
+                self.music_mode = enabled
                 self._version += 1
 
     def set_latency_stats(self, stats: dict):
@@ -213,6 +221,7 @@ class WinstonState:
                 "memoryFacts": self.memory_facts,
                 "uptime": round(time.time() - self._start_time, 1),
                 "alwaysListenState": self.always_listen_state,
+                "musicMode": self.music_mode,
                 "agentTasks": list(self.agent_tasks),
                 "notes": list(self.notes),
                 "latencyStats": dict(self.latency_stats),

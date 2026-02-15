@@ -107,6 +107,12 @@ class AudioListener:
         # STT provider (initialized in start())
         self._stt_provider = None  # STTProvider instance
 
+        # Debug frame counter for periodic barge-in logging
+        self._debug_frame_counter = 0
+
+        # Music mode state
+        self._music_mode = False
+
         # Import-time config
         from config import (
             ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE,
@@ -253,9 +259,48 @@ class AudioListener:
             self._energy_detector.start_calibration()
 
     def on_tts_stop(self) -> None:
-        """Called when TTS stops playing. Resets energy-delta detector."""
-        self._energy_detector.reset()
+        """Called when TTS stops playing. Resets energy-delta detector.
+
+        During streaming responses (multiple sentences), we keep the detector
+        active between sentences so barge-in remains responsive.
+        """
+        if self._tts_is_speaking is not None and self._tts_is_speaking():
+            # Still speaking (streaming gap) — don't reset detector
+            logger.debug("Barge-in: keeping detector active between streaming sentences")
+        else:
+            # Actually done speaking — full reset
+            self._energy_detector.reset()
         self._al_last_tts_stop_time = time.monotonic()
+
+    def set_music_mode(self, enabled: bool) -> None:
+        """Toggle music mode: raises thresholds to filter background music."""
+        from config import (
+            ALWAYS_LISTEN_ENERGY_THRESHOLD,
+            ALWAYS_LISTEN_MIN_SPEECH_DURATION,
+            MUSIC_MODE_ENERGY_MULTIPLIER,
+            MUSIC_MODE_MIN_SPEECH_DURATION,
+        )
+
+        if enabled:
+            self._al_energy_threshold = ALWAYS_LISTEN_ENERGY_THRESHOLD * MUSIC_MODE_ENERGY_MULTIPLIER
+            self._al_min_speech_duration = MUSIC_MODE_MIN_SPEECH_DURATION
+            self._music_mode = True
+            logger.info(
+                "Music mode ON: energy threshold %.4f → %.4f, min duration %.1fs → %.1fs",
+                ALWAYS_LISTEN_ENERGY_THRESHOLD,
+                self._al_energy_threshold,
+                ALWAYS_LISTEN_MIN_SPEECH_DURATION,
+                self._al_min_speech_duration,
+            )
+        else:
+            self._al_energy_threshold = ALWAYS_LISTEN_ENERGY_THRESHOLD
+            self._al_min_speech_duration = ALWAYS_LISTEN_MIN_SPEECH_DURATION
+            self._music_mode = False
+            logger.info("Music mode OFF: thresholds restored to defaults")
+
+    @property
+    def music_mode(self) -> bool:
+        return self._music_mode
 
     def trigger_listen(self):
         """Manually trigger listen mode (dashboard button fallback).
@@ -313,6 +358,8 @@ class AudioListener:
                 frame = oww_buffer[:CHUNK_SAMPLES]
                 oww_buffer = oww_buffer[CHUNK_SAMPLES:]
 
+                self._debug_frame_counter += 1
+
                 # Barge-in detection during TTS playback
                 if (
                     self._bargein_enabled
@@ -321,6 +368,17 @@ class AudioListener:
                     and self._tts_is_speaking()
                     and time.monotonic() >= self._bargein_cooldown_until
                 ):
+                    # Log barge-in detector state every ~2 seconds (25 frames × 80ms)
+                    if self._debug_frame_counter % 25 == 0:
+                        energy = float(np.sqrt(np.mean(frame**2)))
+                        logger.info(
+                            "[bargein-debug] active=%s cal=%s thresh=%.4f energy=%.4f consec=%d",
+                            self._energy_detector.is_active,
+                            self._energy_detector.is_calibrating,
+                            self._energy_detector.threshold,
+                            energy,
+                            self._energy_detector._consecutive_above,
+                        )
                     self._check_bargein(frame)
 
                 # Always-listen: detect ambient speech (non-blocking)
@@ -475,6 +533,10 @@ class AudioListener:
         if not self._always_listen_enabled or self._al_state == "disabled":
             return
 
+        # Suppress while barge-in recording is active
+        if self._is_listening:
+            return
+
         # Suppress during TTS playback
         if self._tts_is_speaking is not None and self._tts_is_speaking():
             if self._al_state == "accumulating":
@@ -562,6 +624,38 @@ class AudioListener:
             self._al_state = "idle"
             tracker.discard(interaction_id)
             return
+
+        # ── Music/noise filtering ──
+        from config import MUSIC_ENERGY_VARIANCE_THRESHOLD, MUSIC_MAX_CONTINUOUS_DURATION
+
+        # 1. Long continuous audio without silence gaps → likely music
+        if duration >= MUSIC_MAX_CONTINUOUS_DURATION and self._al_silence_counter < 0.3:
+            logger.info(
+                "Always-listen: filtered as music/noise (%.1fs continuous, no silence gaps)",
+                duration,
+            )
+            self._al_state = "idle"
+            tracker.discard(interaction_id)
+            return
+
+        # 2. Energy variance check: speech has high CV, music has low CV
+        chunk_energies = np.array([float(np.sqrt(np.mean(c**2))) for c in audio_chunks])
+        if len(chunk_energies) > 5:
+            mean_e = chunk_energies.mean()
+            if mean_e > 0:
+                cv = chunk_energies.std() / mean_e  # Coefficient of variation
+                if cv < MUSIC_ENERGY_VARIANCE_THRESHOLD:
+                    logger.info(
+                        "Always-listen: filtered as music/noise (energy CV=%.3f < %.3f, duration=%.1fs)",
+                        cv,
+                        MUSIC_ENERGY_VARIANCE_THRESHOLD,
+                        duration,
+                    )
+                    self._al_state = "idle"
+                    tracker.discard(interaction_id)
+                    return
+                else:
+                    logger.debug("Always-listen: energy CV=%.3f (speech-like), proceeding", cv)
 
         with self._al_active_threads_lock:
             self._al_active_threads += 1

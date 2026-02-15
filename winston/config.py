@@ -45,9 +45,9 @@ MIN_AUDIO_DURATION = 0.2  # Minimum seconds of audio to attempt transcription
 
 # Barge-in / Interruption
 BARGEIN_ENABLED = True  # Master switch for barge-in feature
-BARGEIN_ENERGY_THRESHOLD = 0.03  # Absolute floor for barge-in trigger (RMS)
-BARGEIN_THRESHOLD_FACTOR = 1.5  # Trigger at Nx the TTS echo level (was 2.0 — too hard to interrupt)
-BARGEIN_CONSECUTIVE_FRAMES = 3  # Consecutive frames above threshold to trigger (3 × 80ms = 240ms)
+BARGEIN_ENERGY_THRESHOLD = 0.015  # Absolute floor for barge-in trigger (RMS) — lowered so quiet speech triggers
+BARGEIN_THRESHOLD_FACTOR = 1.8  # Trigger at Nx the TTS echo level (raised from 1.5: mean-based cal needs higher factor)
+BARGEIN_CONSECUTIVE_FRAMES = 2  # Consecutive frames above threshold to trigger (2 × 80ms = 160ms)
 
 # Always-Listening (ambient conversation detection — no wake word needed)
 ALWAYS_LISTEN_ENABLED = True  # Master toggle for always-listening mode
@@ -61,6 +61,13 @@ ALWAYS_LISTEN_COOLDOWN_AFTER_TTS = 1.5  # Wait after TTS stops before re-enablin
 ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE = 0.5  # Short debounce after dispatch (echo handled by TTS cooldown)
 ALWAYS_LISTEN_CONTINUATION_WINDOW = 8.0  # Seconds after addressed speech to treat new speech as continuation
 ALWAYS_LISTEN_STORE_REJECTED = True  # Store non-Winston speech as ambient context observations
+
+# Music / Background Noise Filtering
+MUSIC_MODE_ENABLED = False  # Manual toggle: raise thresholds when music is playing
+MUSIC_MODE_ENERGY_MULTIPLIER = 5.0  # Multiply energy threshold by this in music mode
+MUSIC_MODE_MIN_SPEECH_DURATION = 3.0  # Require longer speech segments in music mode
+MUSIC_ENERGY_VARIANCE_THRESHOLD = 0.3  # Skip transcription if energy variance ratio (CV) < this
+MUSIC_MAX_CONTINUOUS_DURATION = 10.0  # Skip if speech segment exceeds this without silence gaps
 
 # Streaming / Latency Optimization
 STREAMING_ENABLED = True  # Use streaming Claude responses (sentence-by-sentence to TTS)

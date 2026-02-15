@@ -390,6 +390,32 @@ class Winston:
                 tracker.discard(interaction_id)
                 return
 
+            # Quick local check for music mode toggle (no API call needed)
+            text_lower = text.strip().lower()
+            if any(phrase in text_lower for phrase in [
+                "music mode on", "musik modus an", "playing music", "ich höre musik",
+                "winston music on", "winston musik an",
+            ]):
+                self.audio.set_music_mode(True)
+                self.state.set_music_mode(True)
+                msg = "Music mode on. I'll only listen for louder, direct speech." if lang != "de" else "Musikmodus an. Ich höre nur auf lautere, direkte Sprache."
+                self.tts.speak_async(msg)
+                self.state.set_status("idle")
+                tracker.discard(interaction_id)
+                return
+
+            if any(phrase in text_lower for phrase in [
+                "music mode off", "musik modus aus", "music off", "musik aus",
+                "winston music off", "winston musik aus",
+            ]):
+                self.audio.set_music_mode(False)
+                self.state.set_music_mode(False)
+                msg = "Music mode off. Listening normally." if lang != "de" else "Musikmodus aus. Ich höre normal."
+                self.tts.speak_async(msg)
+                self.state.set_status("idle")
+                tracker.discard(interaction_id)
+                return
+
             self.state.set_status("thinking")
 
             # Get frame + context in parallel
