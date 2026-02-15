@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winston"
+version = "0.1.0"
+description = "AI workshop assistant with vision, voice, and autonomous computer control"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Roberto De la Cruz" },
+]
+keywords = ["ai", "assistant", "workshop", "voice", "vision", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "opencv-python-headless>=4.8",
+    "numpy",
+    "anthropic>=0.40.0",
+    "chromadb>=0.4",
+    "faster-whisper>=1.0.0",
+    "openwakeword>=0.6",
+    "pyttsx3",
+    "elevenlabs>=2.0",
+    "python-dotenv",
+    "Pillow",
+    "sounddevice",
+    "scipy",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "websockets>=11.0",
+    "ddgs>=9.0",
+    "groq>=0.4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+include = ["winston*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["winston"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = ["venv", "winston/venv", "*.egg-info"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "E402"]
+
+[tool.ruff.lint.per-file-ignores]
+"winston/config.py" = ["F841"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
