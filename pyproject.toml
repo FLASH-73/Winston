@@ -58,9 +58,9 @@ pythonpath = ["winston"]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 120
-exclude = ["venv", "winston/venv", "*.egg-info"]
+exclude = [".venv*", "venv", "winston/venv", "*.egg-info"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
@@ -70,5 +70,5 @@ ignore = ["E501", "E402"]
 "winston/config.py" = ["F841"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 ignore_missing_imports = true
