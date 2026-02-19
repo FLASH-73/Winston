@@ -298,19 +298,54 @@ class TelegramBot:
 
     def start(self):
         """Blocking — called from the daemon thread. Runs polling or webhook."""
-        self._setup_application()
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._setup_application()
 
-        from config import TELEGRAM_WEBHOOK_URL
+            from config import TELEGRAM_WEBHOOK_URL
 
-        if TELEGRAM_WEBHOOK_URL:
-            self._start_webhook(TELEGRAM_WEBHOOK_URL)
-        else:
-            async def _post_init(_app):
-                self._loop = asyncio.get_running_loop()
+            if TELEGRAM_WEBHOOK_URL:
+                self._start_webhook(TELEGRAM_WEBHOOK_URL)
+            else:
+                loop.run_until_complete(self._run_polling())
+        except Exception:
+            logger.exception("Telegram bot crashed")
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            if not loop.is_closed():
+                loop.close()
 
-            self._application.post_init = _post_init
+    async def _run_polling(self):
+        """Async polling without signal handlers (safe for non-main threads)."""
+        app = self._application
+        self._loop = asyncio.get_running_loop()
+        self._stop_event = asyncio.Event()
+        try:
+            await app.initialize()
+            await app.updater.start_polling(drop_pending_updates=True)
+            await app.start()
             logger.info("Telegram bot polling started")
-            self._application.run_polling(drop_pending_updates=True)
+            await self._stop_event.wait()
+        except Exception:
+            logger.exception("Telegram polling error")
+        finally:
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception:
+                logger.exception("Error during Telegram shutdown")
+
+    def stop(self):
+        """Signal the polling loop to stop (thread-safe)."""
+        if hasattr(self, '_stop_event') and self._stop_event is not None:
+            loop = self._loop
+            if loop and loop.is_running():
+                loop.call_soon_threadsafe(self._stop_event.set)
 
     def _start_webhook(self, webhook_url: str):
         """Register webhook and keep event loop alive for processing updates."""
