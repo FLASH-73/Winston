@@ -32,8 +32,19 @@ class STTResult:
 class STTProvider(Protocol):
     """Protocol for speech-to-text providers."""
 
-    def transcribe(self, audio_data: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Optional[STTResult]:
-        """Transcribe audio. Returns STTResult or None on failure."""
+    def transcribe(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        language_hint: Optional[str] = None,
+        context_prompt: Optional[str] = None,
+    ) -> Optional[STTResult]:
+        """Transcribe audio. Returns STTResult or None on failure.
+
+        Args:
+            language_hint: ISO-639-1 language code (e.g. "de") to improve accuracy.
+            context_prompt: Recent transcription context to help Whisper with continuity.
+        """
         ...
 
 
@@ -64,7 +75,13 @@ class LocalWhisperProvider:
             logger.error("Failed to load Whisper model: %s", e)
             return False
 
-    def transcribe(self, audio_data: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Optional[STTResult]:
+    def transcribe(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        language_hint: Optional[str] = None,
+        context_prompt: Optional[str] = None,
+    ) -> Optional[STTResult]:
         if not self._ensure_model():
             return None
 
@@ -82,14 +99,14 @@ class LocalWhisperProvider:
             segments, info = self._model.transcribe(
                 audio,
                 beam_size=5,
-                language=None,
+                language=language_hint,
                 vad_filter=True,
-                initial_prompt=WHISPER_PROMPT,
+                initial_prompt=context_prompt or WHISPER_PROMPT,
             )
             text = " ".join(seg.text for seg in segments).strip()
             lang = info.language if info else "en"
             duration_ms = (time.monotonic() - start) * 1000
-            logger.info("Transcription [%s] (local, %.0fms): %s", lang, duration_ms, text)
+            logger.info("Transcription [%s] (local, %.0fms, hint=%s): %s", lang, duration_ms, language_hint, text)
             return STTResult(text=text, language=lang, confidence=0.0, duration_ms=duration_ms)
         except Exception as e:
             logger.error("Local transcription failed: %s", e)
@@ -106,21 +123,32 @@ class GroqWhisperProvider:
         self._model = model
         logger.info("STT: Groq API (model: %s)", model)
 
-    def transcribe(self, audio_data: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Optional[STTResult]:
+    def transcribe(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        language_hint: Optional[str] = None,
+        context_prompt: Optional[str] = None,
+    ) -> Optional[STTResult]:
         start = time.monotonic()
         try:
             wav_bytes = _audio_to_wav(audio_data, sample_rate)
 
-            response = self._client.audio.transcriptions.create(
-                file=("audio.wav", wav_bytes),
-                model=self._model,
-                response_format="verbose_json",
-                prompt=WHISPER_PROMPT,
-            )
+            prompt = context_prompt if context_prompt else WHISPER_PROMPT
+            kwargs: dict = {
+                "file": ("audio.wav", wav_bytes),
+                "model": self._model,
+                "response_format": "verbose_json",
+                "prompt": prompt,
+            }
+            if language_hint:
+                kwargs["language"] = language_hint
+
+            response = self._client.audio.transcriptions.create(**kwargs)
             text = response.text.strip() if response.text else ""
             lang = getattr(response, "language", "en") or "en"
             duration_ms = (time.monotonic() - start) * 1000
-            logger.info("Transcription [%s] (groq, %.0fms): %s", lang, duration_ms, text)
+            logger.info("Transcription [%s] (groq, %.0fms, hint=%s): %s", lang, duration_ms, language_hint, text)
             return STTResult(text=text, language=lang, confidence=0.0, duration_ms=duration_ms)
         except Exception as e:
             logger.error("Groq transcription failed: %s", e)
@@ -134,12 +162,18 @@ class FallbackSTTProvider:
         self._primary = primary
         self._fallback = fallback
 
-    def transcribe(self, audio_data: np.ndarray, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Optional[STTResult]:
-        result = self._primary.transcribe(audio_data, sample_rate)
+    def transcribe(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        language_hint: Optional[str] = None,
+        context_prompt: Optional[str] = None,
+    ) -> Optional[STTResult]:
+        result = self._primary.transcribe(audio_data, sample_rate, language_hint, context_prompt)
         if result is not None:
             return result
         logger.warning("Primary STT failed, falling back to secondary provider")
-        return self._fallback.transcribe(audio_data, sample_rate)
+        return self._fallback.transcribe(audio_data, sample_rate, language_hint, context_prompt)
 
 
 def create_stt_provider() -> STTProvider:

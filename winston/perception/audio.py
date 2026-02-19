@@ -22,11 +22,34 @@ WHISPER_HALLUCINATIONS = {
     "the end",
     "thanks for listening",
     "subtitles by",
+    # Bilingual prompt-leak variants
+    "bilingual",
+    "bilingual messages",
+    # Common short hallucinations
+    "thank you",
+    "thanks",
 }
 
 # Whisper prompt words — used to detect prompt-leak transcriptions.
 # When Whisper gets ambiguous audio, it echoes back the prompt text.
 WHISPER_PROMPT_WORDS = set("winston workshop assistant bilingual english and german".split())
+
+# Minimum viable transcription length (characters). Shorter = garbage/noise.
+_MIN_TRANSCRIPTION_LENGTH = 3
+
+
+def _is_garbage_transcription(text: str) -> bool:
+    """Return True if transcription is too short or only punctuation/whitespace."""
+    stripped = text.strip()
+    if len(stripped) < _MIN_TRANSCRIPTION_LENGTH:
+        return True
+    # Remove all word characters — if nothing alphanumeric remains, it's garbage
+    import re
+
+    if not re.sub(r"[^\w]", "", stripped):
+        return True
+    return False
+
 
 SAMPLE_RATE = 16000  # Both openwakeword and Whisper need 16kHz
 CHUNK_SAMPLES = 1280  # 80ms at 16kHz — openwakeword's expected frame size
@@ -107,8 +130,23 @@ class AudioListener:
         # STT provider (initialized in start())
         self._stt_provider = None  # STTProvider instance
 
+        # Language tracking for STT hints (improves accuracy for non-English speech)
+        self._recent_languages: deque[str] = deque(maxlen=5)
+        self._recent_transcriptions: deque[str] = deque(maxlen=3)
+
         # Debug frame counter for periodic barge-in logging
         self._debug_frame_counter = 0
+
+        # Pipeline state tracking + watchdog
+        self._pipeline_state = "idle"  # "idle" | "recording" | "speaking" | "cooldown"
+        self._pipeline_state_lock = threading.Lock()
+        self._pipeline_state_changed_at = time.monotonic()
+
+        # TTS active flag — set by on_tts_start/stop callbacks (no race condition)
+        self._tts_active = False
+
+        # Explicit cooldown end time — set when entering cooldown state
+        self._cooldown_end_time = 0.0
 
         # Music mode state
         self._music_mode = False
@@ -255,6 +293,8 @@ class AudioListener:
         Only calibrates if detector is not already active — avoids resetting
         mid-response during streaming multi-sentence playback.
         """
+        self._tts_active = True
+        self._set_pipeline_state("speaking")
         if not self._energy_detector.is_active:
             self._energy_detector.start_calibration()
 
@@ -269,8 +309,58 @@ class AudioListener:
             logger.debug("Barge-in: keeping detector active between streaming sentences")
         else:
             # Actually done speaking — full reset
+            self._tts_active = False
             self._energy_detector.reset()
+            self._set_pipeline_state("cooldown")
+            self._cooldown_end_time = time.monotonic() + self._al_cooldown_after_tts
         self._al_last_tts_stop_time = time.monotonic()
+
+    # ── Pipeline state tracking + watchdog ──────────────────────────────
+
+    def _set_pipeline_state(self, state: str) -> None:
+        """Update pipeline state with timestamp and logging."""
+        with self._pipeline_state_lock:
+            old = self._pipeline_state
+            self._pipeline_state = state
+            self._pipeline_state_changed_at = time.monotonic()
+            if old != state:
+                logger.info("Audio pipeline: %s -> %s", old, state)
+        # Reset barge-in detector on transition to idle to clear stale
+        # consecutive counts that could trigger false barge-ins.
+        if state == "idle" and old != "idle":
+            self._energy_detector.reset()
+
+    @property
+    def pipeline_state(self) -> str:
+        """Current pipeline state for external monitoring."""
+        with self._pipeline_state_lock:
+            return self._pipeline_state
+
+    def _check_watchdog(self) -> None:
+        """Force-reset to idle if stuck in a non-idle state too long."""
+        from config import AUDIO_WATCHDOG_TIMEOUT
+
+        with self._pipeline_state_lock:
+            state = self._pipeline_state
+            elapsed = time.monotonic() - self._pipeline_state_changed_at
+
+        if state == "idle":
+            return
+
+        if elapsed > AUDIO_WATCHDOG_TIMEOUT:
+            logger.warning(
+                "WATCHDOG: Audio pipeline stuck in '%s' for %.1fs — force-resetting to idle",
+                state,
+                elapsed,
+            )
+            self._is_listening = False
+            self._listen_buffer = []
+            self._energy_detector.reset()
+            self._bargein_cooldown_until = 0.0
+            if self._always_listen_enabled:
+                self._al_state = "idle"
+            self._al_buffer = []
+            self._set_pipeline_state("idle")
 
     def set_music_mode(self, enabled: bool) -> None:
         """Toggle music mode: raises thresholds to filter background music."""
@@ -327,7 +417,7 @@ class AudioListener:
         self._audio_buffer.append(chunk)
         if self._is_listening:
             self._listen_buffer.append(chunk)
-        if self._al_state == "accumulating":
+        if self._al_state == "accumulating" and not self._tts_active:
             self._al_buffer.append(chunk)
         # Publish audio level for dashboard
         self._current_audio_level = float(np.sqrt(np.mean(chunk**2)))
@@ -360,13 +450,18 @@ class AudioListener:
 
                 self._debug_frame_counter += 1
 
-                # Barge-in detection during TTS playback
+                # Barge-in detection during TTS playback.
+                # Gate on _tts_active (set by on_tts_start callback, same time
+                # as calibration start) — NOT tts.is_speaking (set earlier,
+                # before HTTP download, when detector isn't ready yet).
+                # 200ms debounce after state transitions prevents stale audio
+                # frames from triggering false barge-ins.
                 if (
                     self._bargein_enabled
                     and not self._is_listening
-                    and self._tts_is_speaking is not None
-                    and self._tts_is_speaking()
+                    and self._tts_active
                     and time.monotonic() >= self._bargein_cooldown_until
+                    and (time.monotonic() - self._pipeline_state_changed_at) >= 0.2
                 ):
                     # Log barge-in detector state every ~2 seconds (25 frames × 80ms)
                     if self._debug_frame_counter % 25 == 0:
@@ -384,6 +479,10 @@ class AudioListener:
                 # Always-listen: detect ambient speech (non-blocking)
                 if not self._is_listening:
                     self._al_process_frame(frame)
+
+                # Watchdog: check for stuck pipeline states (~every 5s)
+                if self._debug_frame_counter % 62 == 0:
+                    self._check_watchdog()
 
     def _handle_wake_word(self):
         """Handle wake word detection: acknowledge and record immediately."""
@@ -416,102 +515,120 @@ class AudioListener:
                         barge-in loops from ambient noise (3D printer, etc.).
         """
         # Enter listening mode
+        self._set_pipeline_state("recording")
         self._listen_buffer = []
         self._is_listening = True
         self._listen_start_time = time.time()
 
         logger.info("Listening for speech...")
 
-        # Record until silence or timeout
-        consecutive_silence = 0.0
-        last_check = time.time()
+        try:
+            # Record until silence or timeout
+            consecutive_silence = 0.0
+            last_check = time.time()
 
-        while self._is_listening:
-            time.sleep(0.1)
-            elapsed = time.time() - self._listen_start_time
+            while self._is_listening:
+                time.sleep(0.1)
+                elapsed = time.time() - self._listen_start_time
 
-            # Timeout check
-            if elapsed > self._listen_timeout:
-                logger.info("Listen timeout reached (%.0fs)", self._listen_timeout)
-                break
+                # Timeout check
+                if elapsed > self._listen_timeout:
+                    logger.info("Listen timeout reached (%.0fs)", self._listen_timeout)
+                    break
 
-            # Silence detection — check accumulated audio in chunks
-            now = time.time()
-            if now - last_check >= 0.5 and self._listen_buffer:
-                last_check = now
-                # Check the last 0.5s of audio
-                recent = self._listen_buffer[-int(SAMPLE_RATE * 0.5 / CHUNK_SAMPLES) :]
-                if recent:
-                    recent_audio = np.concatenate(recent)
-                    if self._detect_silence(recent_audio):
-                        consecutive_silence += 0.5
-                        if consecutive_silence >= SILENCE_DURATION:
-                            logger.info("Silence detected, stopping recording")
-                            break
-                    else:
-                        consecutive_silence = 0.0
-
-        self._is_listening = False
-
-        # Transcribe
-        if self._listen_buffer:
-            audio = np.concatenate(self._listen_buffer)
-            self._listen_buffer = []
-
-            # Skip if very short (probably just noise after wake word)
-            if len(audio) < SAMPLE_RATE * self._min_audio_duration:
-                logger.info("Audio too short (%.2fs), skipping transcription", len(audio) / SAMPLE_RATE)
-                if is_bargein:
-                    self._bargein_cooldown_until = time.monotonic() + 3.0
-                    logger.info("Barge-in false positive (short audio) — cooldown 3s")
-                return
-
-            result = self._stt_provider.transcribe(audio)
-            text = result.text if result else ""
-            lang = result.language if result else "en"
-
-            # Barge-in false positive detection: if we got no speech, suppress
-            # further barge-in for a cooldown period to break infinite loops.
-            if is_bargein and (not text or not text.strip()):
-                self._bargein_cooldown_until = time.monotonic() + 3.0
-                logger.info("Barge-in false positive (empty transcription) — cooldown 3s")
-                return
-
-            if text and self._on_transcription:
-                # Echo text handling: strip TTS prefix from transcription
-                if self._get_last_tts_text is not None:
-                    from utils.echo_cancel import echo_text_overlap, strip_echo_prefix
-
-                    last_tts = self._get_last_tts_text()
-                    if last_tts:
-                        # First try prefix stripping ("Yes, how are you?" -> "how are you?")
-                        cleaned = strip_echo_prefix(text, last_tts)
-                        if not cleaned:
-                            # All words were TTS echo — discard entirely
-                            logger.info("Echo rejected (all words matched TTS): '%s'", text)
-                            return
-                        if cleaned != text:
-                            text = cleaned
+                # Silence detection — check accumulated audio in chunks
+                now = time.time()
+                if now - last_check >= 0.5 and self._listen_buffer:
+                    last_check = now
+                    # Check the last 0.5s of audio
+                    recent = self._listen_buffer[-int(SAMPLE_RATE * 0.5 / CHUNK_SAMPLES) :]
+                    if recent:
+                        recent_audio = np.concatenate(recent)
+                        if self._detect_silence(recent_audio):
+                            consecutive_silence += 0.5
+                            if consecutive_silence >= SILENCE_DURATION:
+                                logger.info("Silence detected, stopping recording")
+                                break
                         else:
-                            # No prefix match — fall back to overlap check
-                            overlap = echo_text_overlap(text, last_tts)
-                            if overlap > 0.6:
-                                logger.info(
-                                    "Echo rejected (%.0f%% overlap with TTS): '%s'",
-                                    overlap * 100,
-                                    text,
-                                )
-                                return
+                            consecutive_silence = 0.0
 
-                # Run callback in separate thread to avoid blocking audio processing
-                threading.Thread(
-                    target=self._on_transcription,
-                    args=(text, lang),
-                    daemon=True,
-                    name="transcription-handler",
-                ).start()
-        else:
-            logger.info("No audio captured")
+            # Transcribe
+            if self._listen_buffer:
+                audio = np.concatenate(self._listen_buffer)
+                self._listen_buffer = []
+
+                # Skip if very short (probably just noise after wake word)
+                if len(audio) < SAMPLE_RATE * self._min_audio_duration:
+                    logger.info("Audio too short (%.2fs), skipping transcription", len(audio) / SAMPLE_RATE)
+                    if is_bargein:
+                        self._bargein_cooldown_until = time.monotonic() + 3.0
+                        logger.info("Barge-in false positive (short audio) — cooldown 3s")
+                    return
+
+                result = self._stt_provider.transcribe(
+                    audio,
+                    language_hint=self._get_language_hint(),
+                    context_prompt=self._get_context_prompt(),
+                )
+                self._update_stt_tracking(result)
+                text = result.text if result else ""
+                lang = result.language if result else "en"
+
+                # Barge-in false positive detection: if we got no speech, suppress
+                # further barge-in for a cooldown period to break infinite loops.
+                if is_bargein and (not text or not text.strip()):
+                    self._bargein_cooldown_until = time.monotonic() + 3.0
+                    logger.info("Barge-in false positive (empty transcription) — cooldown 3s")
+                    return
+
+                # Filter short/garbage transcriptions
+                if text and _is_garbage_transcription(text):
+                    logger.info("Wake-word: filtered garbage transcription: '%s'", text)
+                    if is_bargein:
+                        self._bargein_cooldown_until = time.monotonic() + 3.0
+                    return
+
+                if text and self._on_transcription:
+                    # Echo text handling: strip TTS prefix from transcription
+                    if self._get_last_tts_text is not None:
+                        from utils.echo_cancel import echo_text_overlap, strip_echo_prefix
+
+                        last_tts = self._get_last_tts_text()
+                        if last_tts:
+                            # First try prefix stripping ("Yes, how are you?" -> "how are you?")
+                            cleaned = strip_echo_prefix(text, last_tts)
+                            if not cleaned:
+                                # All words were TTS echo — discard entirely
+                                logger.info("Echo rejected (all words matched TTS): '%s'", text)
+                                return
+                            if cleaned != text:
+                                text = cleaned
+                            else:
+                                # No prefix match — fall back to overlap check
+                                overlap = echo_text_overlap(text, last_tts)
+                                if overlap > 0.6:
+                                    logger.info(
+                                        "Echo rejected (%.0f%% overlap with TTS): '%s'",
+                                        overlap * 100,
+                                        text,
+                                    )
+                                    return
+
+                    # Run callback in separate thread to avoid blocking audio processing
+                    threading.Thread(
+                        target=self._on_transcription,
+                        args=(text, lang),
+                        daemon=True,
+                        name="transcription-handler",
+                    ).start()
+            else:
+                logger.info("No audio captured")
+        except Exception as e:
+            logger.error("Error in _record_and_transcribe: %s", e, exc_info=True)
+        finally:
+            self._is_listening = False
+            self._listen_buffer = []
+            self._set_pipeline_state("idle")
 
     def _check_bargein(self, frame: np.ndarray):
         """Detect user speech during TTS using energy spike detection."""
@@ -522,6 +639,47 @@ class AudioListener:
         """Return True if audio chunk is below silence threshold."""
         rms = np.sqrt(np.mean(audio_chunk**2)) * 32768  # Convert float32 to int16 scale
         return rms < self._silence_threshold
+
+    # ── STT language tracking ────────────────────────────────────────
+
+    def _get_language_hint(self) -> Optional[str]:
+        """Return a language hint if recent transcriptions consistently use one language.
+
+        Requires >= 2 of the last 5 transcriptions to be in the same non-English
+        language. For English, returns None (auto-detect is fine for English).
+        """
+        if len(self._recent_languages) < 2:
+            return None
+        from collections import Counter
+
+        counts = Counter(self._recent_languages)
+        most_common_lang, count = counts.most_common(1)[0]
+        if most_common_lang != "en" and count >= 2:
+            return most_common_lang
+        return None
+
+    def _get_context_prompt(self) -> Optional[str]:
+        """Build a context prompt from recent transcriptions for Whisper continuity.
+
+        Prepends the base WHISPER_PROMPT, appends last 2-3 transcriptions.
+        Groq limits prompt to 224 tokens, so truncate to ~200 words.
+        """
+        if not self._recent_transcriptions:
+            return None
+        from perception.stt import WHISPER_PROMPT
+
+        recent = " ".join(self._recent_transcriptions)
+        combined = f"{WHISPER_PROMPT} {recent}"
+        words = combined.split()
+        if len(words) > 200:
+            combined = " ".join(words[:200])
+        return combined
+
+    def _update_stt_tracking(self, result) -> None:
+        """Update language and transcription tracking after successful STT."""
+        if result and result.text and result.text.strip():
+            self._recent_languages.append(result.language)
+            self._recent_transcriptions.append(result.text.strip())
 
     # ── Always-listen state machine ───────────────────────────────────
 
@@ -537,13 +695,27 @@ class AudioListener:
         if self._is_listening:
             return
 
-        # Suppress during TTS playback
+        # Pipeline cooldown → idle (runs BEFORE TTS-speaking guards so it
+        # can't get blocked by tts.is_speaking being True during cooldown)
+        if self._pipeline_state == "cooldown":
+            if time.monotonic() >= self._cooldown_end_time:
+                self._set_pipeline_state("idle")
+
+        # Suppress during TTS — check pipeline state (immune to race condition)
+        if self._pipeline_state == "speaking":
+            self._al_last_tts_stop_time = time.monotonic()
+            if self._al_state == "accumulating":
+                self._al_cancel("Pipeline speaking")
+            return
+
+        # Suppress during TTS playback (redundant check via TTS callable)
         if self._tts_is_speaking is not None and self._tts_is_speaking():
+            self._al_last_tts_stop_time = time.monotonic()
             if self._al_state == "accumulating":
                 self._al_cancel("TTS started playing")
             return
 
-        # Cooldown check
+        # Always-listen cooldown check
         if self._al_state == "cooldown":
             if time.monotonic() >= self._al_cooldown_until:
                 self._al_state = "idle"
@@ -625,6 +797,21 @@ class AudioListener:
             tracker.discard(interaction_id)
             return
 
+        # Speech density check: require >= 30% of frames above energy threshold.
+        # Filters single-spike transients (clicks, bumps) that pass onset but aren't speech.
+        speech_frames = sum(
+            1 for c in audio_chunks if float(np.sqrt(np.mean(c**2))) >= self._al_energy_threshold
+        )
+        speech_ratio = speech_frames / len(audio_chunks) if audio_chunks else 0
+        if speech_ratio < 0.3:
+            logger.debug(
+                "Always-listen: low speech density (%.0f%% frames above threshold), skipping",
+                speech_ratio * 100,
+            )
+            self._al_state = "idle"
+            tracker.discard(interaction_id)
+            return
+
         # ── Music/noise filtering ──
         from config import MUSIC_ENERGY_VARIANCE_THRESHOLD, MUSIC_MAX_CONTINUOUS_DURATION
 
@@ -684,7 +871,12 @@ class AudioListener:
                     LatencyTracker.get().discard(interaction_id)
                 return
 
-            result = self._stt_provider.transcribe(audio)
+            result = self._stt_provider.transcribe(
+                audio,
+                language_hint=self._get_language_hint(),
+                context_prompt=self._get_context_prompt(),
+            )
+            self._update_stt_tracking(result)
             text = result.text if result else ""
             lang = result.language if result else "en"
 
@@ -701,6 +893,13 @@ class AudioListener:
                         logger.info("[latency] STT: %dms", delta)
 
             if not text or not text.strip():
+                if interaction_id:
+                    LatencyTracker.get().discard(interaction_id)
+                return
+
+            # Filter short/garbage transcriptions (< 3 chars or punctuation-only)
+            if _is_garbage_transcription(text):
+                logger.info("Always-listen: filtered garbage transcription: '%s'", text)
                 if interaction_id:
                     LatencyTracker.get().discard(interaction_id)
                 return
@@ -742,6 +941,13 @@ class AudioListener:
                         return
                     if cleaned != text:
                         text = cleaned
+
+            # Suppress if TTS started playing while we were transcribing
+            if self._tts_active or self._pipeline_state == "speaking":
+                logger.info("Always-listen: suppressing result — TTS now playing: '%s'", text)
+                if interaction_id:
+                    LatencyTracker.get().discard(interaction_id)
+                return
 
             logger.info("Always-listen transcription: '%s'", text)
 

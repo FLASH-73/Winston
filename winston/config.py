@@ -28,6 +28,7 @@ SMART_MODEL = "claude-sonnet-4-5-20250929"  # Deep analysis, on-demand
 CAMERA_SOURCE = None
 CAMERA_INDEX = 0  # Fallback index when interactive selection finds nothing
 CAPTURE_INTERVAL = 3.0  # Seconds between frame captures (perception loop)
+CAMERA_ANALYSIS_INTERVAL = 30.0  # Seconds between Claude API calls for frame analysis (throttle)
 SCENE_CHANGE_THRESHOLD = 0.15  # 0-1, how much the frame must change to trigger analysis
 FRAME_RESOLUTION = (1280, 720)  # Capture resolution
 
@@ -82,11 +83,14 @@ ALWAYS_LISTEN_ENERGY_THRESHOLD = (
 )
 ALWAYS_LISTEN_SILENCE_DURATION = 1.5  # Seconds of silence to end a speech segment
 ALWAYS_LISTEN_TIMEOUT = 15.0  # Max seconds per speech segment (prevents runaway)
-ALWAYS_LISTEN_MIN_SPEECH_DURATION = 0.8  # Ignore segments shorter than this (filters coughs, taps)
+ALWAYS_LISTEN_MIN_SPEECH_DURATION = 1.0  # Ignore segments shorter than this (filters coughs, taps)
 ALWAYS_LISTEN_COOLDOWN_AFTER_TTS = 1.5  # Wait after TTS stops before re-enabling (avoids echo pickup)
 ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE = 0.5  # Short debounce after dispatch (echo handled by TTS cooldown)
 ALWAYS_LISTEN_CONTINUATION_WINDOW = 8.0  # Seconds after addressed speech to treat new speech as continuation
 ALWAYS_LISTEN_STORE_REJECTED = True  # Store non-Winston speech as ambient context observations
+
+# Audio Pipeline Watchdog
+AUDIO_WATCHDOG_TIMEOUT = 30.0  # Force-reset audio pipeline if stuck in non-idle state for this long (seconds)
 
 # Music / Background Noise Filtering
 MUSIC_MODE_ENABLED = False  # Manual toggle: raise thresholds when music is playing
@@ -98,6 +102,7 @@ MUSIC_MAX_CONTINUOUS_DURATION = 10.0  # Skip if speech segment exceeds this with
 # Streaming / Latency Optimization
 STREAMING_ENABLED = True  # Use streaming Claude responses (sentence-by-sentence to TTS)
 TTS_STREAMING_PLAYBACK = True  # Use sd.OutputStream instead of sd.play() for lower latency
+VOICE_CONVERSATION_HISTORY_TURNS = 3  # Max conversation history turns for voice (fewer = faster)
 
 # Proactive
 PROACTIVE_INTERVAL = 30.0  # Seconds between proactive checks
@@ -189,6 +194,7 @@ MEMORY_CONSOLIDATE_MIN_IMPORTANCE = 7  # Keep high-importance entries even after
 # Memory — Context Assembly
 MEMORY_CONTEXT_BUDGET_CONVERSATION = 800  # Max tokens for conversation context
 MEMORY_CONTEXT_BUDGET_PROACTIVE = 500  # Max tokens for proactive context
+MEMORY_CONTEXT_BUDGET_LIGHTWEIGHT = 200  # Max tokens for simple voice queries (facts only, no ChromaDB)
 
 # System Prompts
 SYSTEM_PROMPT_PERCEPTION = """You are Winston, an AI workshop assistant observing a robotics workshop through a camera.
