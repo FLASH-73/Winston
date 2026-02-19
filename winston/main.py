@@ -57,7 +57,9 @@ logger.info("Starting up...")
 
 # Only import lightweight modules at top level (config is just stdlib + dotenv)
 from config import (
+    CAMERA_ANALYSIS_INTERVAL,
     CAPTURE_INTERVAL,
+    STREAMING_ENABLED,
     SYSTEM_PROMPT_PERCEPTION,
 )
 from dashboard.state import WinstonState  # stdlib only, instant
@@ -82,6 +84,14 @@ class Winston:
         self._notes_store = None
         self._telegram_bot = None
         self._telegram_notifier = None
+        # Context cache for continuation window (avoid re-assembling within 8s)
+        self._cached_context: str = ""
+        self._cached_context_time: float = 0.0
+        self._cached_frame_bytes: bytes | None = None
+        # Camera analysis throttling + concern dedup
+        self._last_camera_analysis_time: float = 0.0
+        self._last_concern: str = ""
+        self._last_concern_time: float = 0.0
         # All other modules created lazily in start()
 
     def start(self) -> bool:
@@ -297,7 +307,7 @@ class Winston:
                     daemon=True,
                     name="telegram-bot",
                 ).start()
-                logger.info("Telegram bot started")
+                logger.info("Telegram bot thread launched")
 
                 # Set up proactive Telegram notifications
                 from config import TELEGRAM_NOTIFY_PROACTIVE
@@ -338,11 +348,26 @@ class Winston:
                 if self.state.status == "speaking" and not self.tts.is_speaking:
                     self.state.set_status("idle")
 
+                # Safety: detect stuck TTS state (is_speaking=True but no audio for too long)
+                if self.tts.is_speaking:
+                    stuck_time = time.monotonic() - self.tts.speaking_start_time
+                    if stuck_time > 45.0:
+                        logger.warning(
+                            "TTS stuck for %.1fs (audio pipeline: %s) — force resetting",
+                            stuck_time,
+                            self.audio.pipeline_state,
+                        )
+                        self.tts.interrupt()
+                        self.state.set_status("idle")
+
                 # 1. Capture frame
                 frame_bytes = self.camera.get_frame_bytes()
 
-                # 2. Scene change detection -> Flash analysis
-                if frame_bytes and self.camera.scene_changed():
+                # 2. Scene change detection -> Flash analysis (throttled)
+                conversation_active = self.tts.is_speaking or self.audio.pipeline_state == "recording"
+                analysis_due = (time.monotonic() - self._last_camera_analysis_time) >= CAMERA_ANALYSIS_INTERVAL
+                if frame_bytes and analysis_due and not conversation_active and self.camera.scene_changed():
+                    self._last_camera_analysis_time = time.monotonic()
                     result = self.llm.analyze_frame(
                         frame_bytes,
                         system_prompt=SYSTEM_PROMPT_PERCEPTION,
@@ -359,7 +384,15 @@ class Winston:
                         self.state.set_cost(self.cost_tracker.get_daily_cost())
                         concerns = result.get("concerns")
                         if concerns:
-                            logger.warning("Concern detected: %s", concerns)
+                            concern_text = str(concerns)
+                            is_repeat = (
+                                concern_text == self._last_concern
+                                and (time.monotonic() - self._last_concern_time) < 120.0
+                            )
+                            if not is_repeat:
+                                logger.warning("Concern detected: %s", concerns)
+                                self._last_concern = concern_text
+                                self._last_concern_time = time.monotonic()
 
                 # 3. Proactive check
                 if frame_bytes and self.proactive.should_check():
@@ -423,11 +456,39 @@ class Winston:
 
         return messages
 
+    @staticmethod
+    def _is_simple_query(text: str) -> bool:
+        """Heuristic: is this a simple query that doesn't need full memory context?
+
+        Simple queries use lightweight context (semantic facts only, no ChromaDB search).
+        """
+        words = text.split()
+        if len(words) > 12:
+            return False
+
+        text_lower = text.lower()
+
+        # References to past context need full memory recall
+        memory_triggers = [
+            "remember", "last time", "earlier", "yesterday", "before",
+            "we talked", "you said", "you told me", "that project",
+            "the motor", "the printer", "the arm", "the robot",
+            # German
+            "erinnerst", "letztes mal", "gestern", "vorher", "wir haben",
+            "du hast gesagt", "das projekt",
+        ]
+        for trigger in memory_triggers:
+            if trigger in text_lower:
+                return False
+
+        return True
+
     def _on_bargein(self):
         """Called when barge-in (user speech during TTS) is detected."""
         logger.info("Barge-in detected — interrupting speech")
         self._streaming_abort.set()
         self.tts.interrupt()
+        self._streaming_abort.clear()
 
     def _on_transcription(self, text: str, lang: str = "en", model: str = None, interaction_id: str = None):
         """Called when user speech is transcribed. Runs in a daemon thread.
@@ -477,13 +538,35 @@ class Winston:
 
             self.state.set_status("thinking")
 
-            # Get frame + context in parallel
+            # Decide what context is needed for this query
+            needs_image = self.llm.needs_visual_context(text)
+            context_purpose = "lightweight" if self._is_simple_query(text) else "conversation"
+
+            # Check if we can reuse cached context (continuation window)
+            from config import ALWAYS_LISTEN_CONTINUATION_WINDOW
+            in_continuation = (time.monotonic() - self._last_addressed_time) < ALWAYS_LISTEN_CONTINUATION_WINDOW
+            context_fresh = (time.monotonic() - self._cached_context_time) < ALWAYS_LISTEN_CONTINUATION_WINDOW
+
             t0 = time.time()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                frame_future = executor.submit(self.camera.get_frame_bytes)
-                context_future = executor.submit(self.memory.assemble_context, query=text, purpose="conversation")
-                frame_bytes = frame_future.result(timeout=5)
-                context = context_future.result(timeout=5)
+            if in_continuation and context_fresh and self._cached_context:
+                # Reuse context from the previous utterance in this conversation burst
+                context = self._cached_context
+                frame_bytes = self._cached_frame_bytes if needs_image else None
+                logger.info("[transcription] Reusing cached context (%.1fs old)", time.monotonic() - self._cached_context_time)
+            else:
+                # Fetch frame (only if visual) + context in parallel
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    if needs_image:
+                        frame_future = executor.submit(self.camera.get_frame_bytes)
+                    context_future = executor.submit(self.memory.assemble_context, query=text, purpose=context_purpose)
+                    frame_bytes = frame_future.result(timeout=5) if needs_image else None
+                    context = context_future.result(timeout=5)
+
+                # Cache for potential continuation
+                self._cached_context = context
+                self._cached_context_time = time.monotonic()
+                self._cached_frame_bytes = frame_bytes
+
             # Inject recent agent result so Haiku knows about follow-ups
             recent_agent = self._get_recent_agent_result()
             if recent_agent:
@@ -499,24 +582,60 @@ class Winston:
                     f'\n\n[Previous speech fragment from Roberto (moments ago)]\n"{self._last_user_utterance}"'
                 )
 
-            logger.info("[transcription] Frame + context ready (%.1fms)", (time.time() - t0) * 1000)
+            logger.info("[transcription] Frame: %s, context: %s (%.1fms)",
+                        "included" if frame_bytes else "skipped", context_purpose, (time.time() - t0) * 1000)
 
             # Mark context ready for latency tracking
             if interaction_id:
                 tracker.mark(interaction_id, "context_ready")
 
             # Build conversation history for multi-turn context
-            conversation_history = self._build_conversation_history()
+            from config import VOICE_CONVERSATION_HISTORY_TURNS
+            conversation_history = self._build_conversation_history(max_turns=VOICE_CONVERSATION_HISTORY_TURNS)
 
             # Intelligent routing — Claude Haiku decides what to do
             t0 = time.time()
-            action, data = self.llm.process_user_input(
-                text=text,
-                frame_bytes=frame_bytes,
-                context=context,
-                language=lang,
-                conversation_history=conversation_history,
-            )
+
+            if STREAMING_ENABLED:
+                # Streaming path: sentences are sent to TTS as they arrive
+                sentences_streamed = []
+                first_sentence_sent = False
+
+                def _on_sentence(sentence_text: str):
+                    nonlocal first_sentence_sent
+                    iid = None
+                    if not first_sentence_sent:
+                        first_sentence_sent = True
+                        iid = interaction_id
+                        if interaction_id:
+                            tracker.mark(interaction_id, "llm_first_token")
+                        self.tts.begin_streaming_response()
+                        self.state.set_status("speaking")
+                    sentences_streamed.append(sentence_text)
+                    self.tts.speak_async(sentence_text, interaction_id=iid)
+
+                self._streaming_abort.clear()
+                action, data = self.llm.process_user_input_streaming(
+                    text=text,
+                    frame_bytes=frame_bytes,
+                    context=context,
+                    language=lang,
+                    conversation_history=conversation_history,
+                    on_sentence=_on_sentence,
+                    abort_event=self._streaming_abort,
+                )
+            else:
+                # Non-streaming fallback
+                action, data = self.llm.process_user_input(
+                    text=text,
+                    frame_bytes=frame_bytes,
+                    context=context,
+                    language=lang,
+                    conversation_history=conversation_history,
+                )
+                sentences_streamed = []
+                first_sentence_sent = False
+
             routing_ms = (time.time() - t0) * 1000
             logger.info("[transcription] Routed to '%s' (%.0fms)", action, routing_ms)
 
@@ -525,6 +644,8 @@ class Winston:
                 tracker.mark(interaction_id, "llm_done")
 
             if action == "shutdown":
+                if sentences_streamed:
+                    self.tts.interrupt()
                 logger.info("[transcription] Shutdown command: '%s'", text)
                 from personality import get_catchphrase
 
@@ -536,24 +657,34 @@ class Winston:
                 return
 
             if action == "agent":
+                if sentences_streamed:
+                    self.tts.interrupt()
                 self._spawn_agent_task(data.get("task", text), lang)
                 tracker.finish(interaction_id)
                 return
 
             if action == "note":
+                if sentences_streamed:
+                    self.tts.interrupt()
                 self._handle_note_from_intent(data.get("content", text), lang)
                 tracker.finish(interaction_id)
                 return
 
-            # Conversation — Haiku already generated the response
+            # Conversation — response already streamed (or available in data)
             response = data.get("text", "")
             if response:
+                # End streaming response (signals TTS worker to fire on_speaking_stop)
+                if sentences_streamed:
+                    self.tts.end_streaming_response()
+                else:
+                    # Non-streaming path, or response too short for sentence boundary
+                    self.state.set_status("speaking")
+                    self.tts.speak_async(response, interaction_id=interaction_id)
+
                 self._last_winston_response_time = time.monotonic()
                 self._last_user_utterance = text
                 self.state.add_conversation("user", text)
                 self.state.add_conversation("winston", response)
-                self.state.set_status("speaking")
-                self.tts.speak_async(response, interaction_id=interaction_id)
 
                 conversation_text = f"Q: {text}\nA: {response}"
                 self.memory.store(conversation_text, entry_type="conversation")
@@ -569,6 +700,8 @@ class Winston:
                         name="fact-extraction",
                     ).start()
             else:
+                if sentences_streamed:
+                    self.tts.end_streaming_response()
                 from personality import get_catchphrase
 
                 self.tts.speak_async(get_catchphrase("error_process", "en"))
@@ -953,6 +1086,9 @@ class Winston:
 
         # Brief pause for goodbye TTS to play
         time.sleep(1.5)
+
+        if hasattr(self, '_telegram_bot'):
+            self._telegram_bot.stop()
 
         self.audio.stop()
         self.camera.stop()

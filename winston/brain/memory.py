@@ -37,6 +37,7 @@ from config import (
     MEMORY_CONSOLIDATE_AFTER_DAYS,
     MEMORY_CONSOLIDATE_MIN_IMPORTANCE,
     MEMORY_CONTEXT_BUDGET_CONVERSATION,
+    MEMORY_CONTEXT_BUDGET_LIGHTWEIGHT,
     MEMORY_CONTEXT_BUDGET_PROACTIVE,
     MEMORY_DB_PATH,
     MEMORY_DEDUP_THRESHOLD,
@@ -453,6 +454,8 @@ class SemanticMemory:
         self._profile_path: str = ""
         self._facts: list[dict] = []
         self._chromadb_collection: Optional[chromadb.Collection] = None
+        self._facts_text_cache: str = ""
+        self._facts_cache_valid: bool = False
 
     def initialize(self, client: chromadb.ClientAPI, db_path: str) -> None:
         self._profile_path = os.path.join(db_path, MEMORY_USER_PROFILE_FILE)
@@ -472,9 +475,11 @@ class SemanticMemory:
                 self._facts = []
         else:
             self._facts = []
+        self._facts_cache_valid = False
 
     def _save_profile(self) -> None:
         """Atomically save facts to JSON file."""
+        self._facts_cache_valid = False  # Invalidate formatted text cache
         data = {"facts": self._facts, "updated": datetime.now().isoformat()}
         dir_path = os.path.dirname(self._profile_path)
         os.makedirs(dir_path, exist_ok=True)
@@ -541,8 +546,16 @@ class SemanticMemory:
         return added
 
     def get_all_facts_as_text(self) -> str:
-        """Format all facts as a readable text block for system prompts."""
+        """Format all facts as a readable text block for system prompts.
+
+        Cached — reformatted only when facts change.
+        """
+        if self._facts_cache_valid:
+            return self._facts_text_cache
+
         if not self._facts:
+            self._facts_text_cache = ""
+            self._facts_cache_valid = True
             return ""
 
         lines = ["Known facts about Roberto and the workshop:"]
@@ -557,7 +570,9 @@ class SemanticMemory:
             for item in items:
                 lines.append(f"- {item}")
 
-        return "\n".join(lines)
+        self._facts_text_cache = "\n".join(lines)
+        self._facts_cache_valid = True
+        return self._facts_text_cache
 
     def search_facts(self, query: str, n_results: int = 5) -> list[str]:
         """Semantic search through stored facts."""
@@ -686,12 +701,18 @@ class Memory:
 
         Args:
             query: The user's query (for semantic search). Empty for proactive.
-            purpose: "conversation" or "proactive" — determines token budget.
+            purpose: "conversation", "proactive", or "lightweight" — determines token budget.
+                     "lightweight" skips ChromaDB search and session narrative (fast path).
 
         Returns:
             A formatted context string ready to include in prompts.
         """
-        budget = MEMORY_CONTEXT_BUDGET_CONVERSATION if purpose == "conversation" else MEMORY_CONTEXT_BUDGET_PROACTIVE
+        if purpose == "lightweight":
+            budget = MEMORY_CONTEXT_BUDGET_LIGHTWEIGHT
+        elif purpose == "conversation":
+            budget = MEMORY_CONTEXT_BUDGET_CONVERSATION
+        else:
+            budget = MEMORY_CONTEXT_BUDGET_PROACTIVE
 
         sections = []
         tokens_used = 0
@@ -701,6 +722,10 @@ class Memory:
         if facts_text:
             sections.append(facts_text)
             tokens_used += self._estimate_tokens(facts_text)
+
+        # Lightweight: facts only, skip everything else (no DB calls)
+        if purpose == "lightweight":
+            return "\n".join(sections) if sections else ""
 
         # 2. Session narrative
         narrative = self.working.get_session_narrative()

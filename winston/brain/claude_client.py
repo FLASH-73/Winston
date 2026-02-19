@@ -179,8 +179,84 @@ CONVERSATIONAL_RESPONSES = {
     "natürlich",
 }
 
+# Keywords indicating the query needs camera/visual context (bilingual)
+VISUAL_KEYWORDS = [
+    # Explicit vision requests
+    "look at", "what do you see", "what's on", "show me", "identify",
+    "what is this", "what are these", "can you see", "check this",
+    "what's happening", "what happened",
+    # Spatial/object references
+    "on my desk", "on the table", "on my screen", "on the screen",
+    "in front of", "next to", "the printer", "over there",
+    # Workshop observation
+    "is the", "did i leave", "is it still", "does it look",
+    # German equivalents
+    "schau dir", "was siehst du", "was ist das", "zeig mir",
+    "erkennst du", "auf dem tisch", "auf meinem schreibtisch",
+    "was passiert", "ist das", "hab ich", "auf dem bildschirm",
+]
+
+# Short demonstrative pronouns that suggest pointing at something physical
+_DEMONSTRATIVE_WORDS = {"this", "that", "these", "those", "dies", "das", "diese"}
+
 # Minimum sentence length before flushing to TTS during streaming
 SENTENCE_MIN_LENGTH = 10
+
+# Minimum clause length for comma-based flushing
+CLAUSE_MIN_LENGTH = 35
+
+
+class SentenceChunker:
+    """Accumulates streaming text and fires a callback on sentence boundaries.
+
+    Boundaries: .!? followed by space/newline/uppercase (min SENTENCE_MIN_LENGTH chars),
+                , at CLAUSE_MIN_LENGTH+ chars, \\n at SENTENCE_MIN_LENGTH+ chars.
+    """
+
+    def __init__(self, on_sentence: Callable[[str], None]):
+        self._on_sentence = on_sentence
+        self._buf = ""
+        self._pending_boundary = False
+        self._pending_is_clause = False
+
+    def feed(self, delta: str) -> None:
+        """Feed a text delta from the stream. May fire on_sentence zero or more times."""
+        for ch in delta:
+            self._buf += ch
+            if self._pending_boundary:
+                if ch in (" ", "\n"):
+                    min_len = CLAUSE_MIN_LENGTH if self._pending_is_clause else SENTENCE_MIN_LENGTH
+                    if len(self._buf) >= min_len:
+                        self._on_sentence(self._buf.strip())
+                        self._buf = ""
+                    self._pending_boundary = False
+                    self._pending_is_clause = False
+                elif ch.isupper():
+                    min_len = CLAUSE_MIN_LENGTH if self._pending_is_clause else SENTENCE_MIN_LENGTH
+                    to_flush = self._buf[:-1].strip()
+                    if to_flush and len(to_flush) >= min_len:
+                        self._on_sentence(to_flush)
+                        self._buf = ch
+                    self._pending_boundary = False
+                    self._pending_is_clause = False
+                else:
+                    self._pending_boundary = False
+                    self._pending_is_clause = False
+            elif ch in ".!?":
+                self._pending_boundary = True
+                self._pending_is_clause = False
+            elif ch == "," and len(self._buf.strip()) >= CLAUSE_MIN_LENGTH:
+                self._pending_boundary = True
+                self._pending_is_clause = True
+            elif ch == "\n" and len(self._buf.strip()) >= SENTENCE_MIN_LENGTH:
+                self._on_sentence(self._buf.strip())
+                self._buf = ""
+
+    def flush(self) -> None:
+        """Flush any remaining text as a final sentence."""
+        if self._buf.strip():
+            self._on_sentence(self._buf.strip())
+            self._buf = ""
 
 
 class ClaudeClient:
@@ -212,6 +288,7 @@ class ClaudeClient:
                 model=FAST_MODEL,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "Respond with just the word: ready"}],
+                caller="startup_verify",
             )
             if response is None:
                 logger.warning("Claude API verification failed (transient), continuing anyway")
@@ -262,6 +339,7 @@ class ClaudeClient:
             max_tokens=max_output_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": content}],
+            caller="camera_analysis",
         )
         if response is None:
             return None
@@ -320,6 +398,7 @@ class ClaudeClient:
             max_tokens=max_output_tokens,
             system=system,
             messages=[{"role": "user", "content": content}],
+            caller="conversation",
         )
         if response is None:
             return None
@@ -353,6 +432,7 @@ class ClaudeClient:
             max_tokens=max_tokens,
             system=system_prompt if system_prompt else None,
             messages=[{"role": "user", "content": prompt}],
+            caller="text_only",
         )
         if response is None:
             return None
@@ -379,6 +459,7 @@ class ClaudeClient:
             model=FAST_MODEL,
             max_tokens=3,
             messages=[{"role": "user", "content": prompt}],
+            caller="intent_classification",
         )
         if response:
             self._track_usage(response, FAST_MODEL)
@@ -441,6 +522,26 @@ class ClaudeClient:
         # Ambiguous — needs API
         return None
 
+    @staticmethod
+    def needs_visual_context(text: str) -> bool:
+        """Fast heuristic: does this query benefit from the camera frame?
+
+        Returns True if visual context is likely needed.
+        No API call — pure keyword matching.
+        """
+        text_lower = text.lower().strip()
+
+        for kw in VISUAL_KEYWORDS:
+            if kw in text_lower:
+                return True
+
+        # Short utterances with demonstrative pronouns → likely pointing at something
+        words = text_lower.split()
+        if len(words) <= 6 and _DEMONSTRATIVE_WORDS & set(words):
+            return True
+
+        return False
+
     # ── Streaming chat ────────────────────────────────────────────────
 
     def chat_streaming(
@@ -493,15 +594,10 @@ class ClaudeClient:
         )
 
         try:
-            stream = self._client.messages.stream(**kwargs)
             full_text = ""
-            sentence_buf = ""
-            pending_boundary = False
-            pending_is_clause = False
+            chunker = SentenceChunker(on_sentence) if on_sentence else None
 
-            CLAUSE_MIN_LENGTH = 35  # Higher threshold for comma-based flushing
-
-            with stream as s:
+            with self._client.messages.stream(**kwargs) as s:
                 for delta in s.text_stream:
                     # Check abort (barge-in)
                     if abort_event and abort_event.is_set():
@@ -509,46 +605,12 @@ class ClaudeClient:
                         break
 
                     full_text += delta
-
-                    # Sentence boundary detection
-                    if on_sentence is None:
-                        continue
-
-                    for ch in delta:
-                        sentence_buf += ch
-                        if pending_boundary:
-                            if ch in (" ", "\n"):
-                                min_len = CLAUSE_MIN_LENGTH if pending_is_clause else SENTENCE_MIN_LENGTH
-                                if len(sentence_buf) >= min_len:
-                                    on_sentence(sentence_buf.strip())
-                                    sentence_buf = ""
-                                pending_boundary = False
-                                pending_is_clause = False
-                            elif ch.isupper():
-                                # Split: flush everything before this char
-                                min_len = CLAUSE_MIN_LENGTH if pending_is_clause else SENTENCE_MIN_LENGTH
-                                to_flush = sentence_buf[:-1].strip()
-                                if to_flush and len(to_flush) >= min_len:
-                                    on_sentence(to_flush)
-                                    sentence_buf = ch
-                                pending_boundary = False
-                                pending_is_clause = False
-                            else:
-                                pending_boundary = False
-                                pending_is_clause = False
-                        elif ch in ".!?":
-                            pending_boundary = True
-                            pending_is_clause = False
-                        elif ch == "," and len(sentence_buf.strip()) >= CLAUSE_MIN_LENGTH:
-                            pending_boundary = True
-                            pending_is_clause = True
-                        elif ch == "\n" and len(sentence_buf.strip()) >= SENTENCE_MIN_LENGTH:
-                            on_sentence(sentence_buf.strip())
-                            sentence_buf = ""
+                    if chunker:
+                        chunker.feed(delta)
 
                 # Flush remainder
-                if on_sentence and sentence_buf.strip():
-                    on_sentence(sentence_buf.strip())
+                if chunker:
+                    chunker.flush()
 
                 # Cost tracking from final message
                 final_msg = s.get_final_message()
@@ -628,6 +690,8 @@ class ClaudeClient:
         if language != "en":
             system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
 
+        self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system))
+
         t_llm_start = time.time()
         response = self._call_with_retry(
             model=FAST_MODEL,
@@ -635,6 +699,7 @@ class ClaudeClient:
             system=system,
             tools=ROUTING_TOOLS,
             messages=messages,
+            caller="routing",
         )
         llm_ms = (time.time() - t_llm_start) * 1000
         logger.info("[latency] LLM first-token: %dms", llm_ms)
@@ -685,24 +750,209 @@ class ClaudeClient:
         logger.info("Routing: conversation (%d chars)", len(response_text))
         return ("conversation", {"text": response_text})
 
+    def process_user_input_streaming(
+        self,
+        text: str,
+        frame_bytes: Optional[bytes] = None,
+        context: Optional[str] = None,
+        language: str = "en",
+        conversation_history: Optional[list[dict]] = None,
+        on_sentence: Optional[Callable[[str], None]] = None,
+        abort_event=None,
+    ) -> tuple[str, dict]:
+        """Streaming version of process_user_input().
+
+        Fires on_sentence() for each sentence of a conversation response while
+        the LLM is still generating. For tool calls (agent/note/shutdown),
+        on_sentence may not fire — the tool result is returned as usual.
+
+        Falls back to process_user_input() on any streaming error.
+
+        Returns (action_type, data) — same contract as process_user_input().
+        """
+
+        # Build messages (identical to process_user_input)
+        messages = []
+        if conversation_history:
+            for msg in conversation_history:
+                messages.append(msg)
+
+        prompt = text
+        if context:
+            prompt = f"{text}\n\n{context}"
+
+        content = []
+        if frame_bytes:
+            image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                }
+            )
+        content.append({"type": "text", "text": prompt})
+
+        # Ensure proper alternation: if last history message is "user", merge
+        if messages and messages[-1]["role"] == "user":
+            if isinstance(messages[-1]["content"], str):
+                messages[-1]["content"] = [{"type": "text", "text": messages[-1]["content"]}]
+            messages[-1]["content"].extend(content)
+        else:
+            messages.append({"role": "user", "content": content})
+
+        system = get_routing_prompt()
+        if language != "en":
+            system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
+
+        kwargs = dict(
+            model=FAST_MODEL,
+            max_tokens=500,
+            system=system,
+            tools=ROUTING_TOOLS,
+            messages=messages,
+        )
+
+        full_text = ""
+        try:
+            t_start = time.time()
+            first_token_logged = False
+            chunker = SentenceChunker(on_sentence) if on_sentence else None
+
+            self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system))
+            logger.info("[api] routing_streaming: calling %s", FAST_MODEL)
+            with self._client.messages.stream(**kwargs) as stream:
+                for delta in stream.text_stream:
+                    # Log first-token latency
+                    if not first_token_logged:
+                        first_token_ms = (time.time() - t_start) * 1000
+                        logger.info("[latency] LLM first-token: %dms", first_token_ms)
+                        first_token_logged = True
+
+                    # Check abort (barge-in)
+                    if abort_event and abort_event.is_set():
+                        logger.info("Streaming routing aborted (barge-in)")
+                        break
+
+                    full_text += delta
+                    if chunker:
+                        chunker.feed(delta)
+
+                # Flush remaining buffered text
+                if chunker:
+                    chunker.flush()
+
+                # Get final message for tool-call detection and cost tracking
+                final_msg = stream.get_final_message()
+                llm_ms = (time.time() - t_start) * 1000
+                logger.info("[latency] LLM total: %dms", llm_ms)
+
+                self._track_usage(final_msg, FAST_MODEL)
+
+                # Check for tool use in the final message
+                for block in final_msg.content:
+                    if block.type == "tool_use":
+                        tool_name = block.name
+                        tool_input = block.input
+
+                        if tool_name == "delegate_to_agent":
+                            task = tool_input.get("task", text)
+                            logger.info("Routing: delegate_to_agent('%s')", task[:100])
+                            return ("agent", {"task": task, "_streamed_text": full_text})
+
+                        elif tool_name == "save_note":
+                            note_content = tool_input.get("content", text)
+                            logger.info("Routing: save_note('%s')", note_content[:100])
+                            return ("note", {"content": note_content, "_streamed_text": full_text})
+
+                        elif tool_name == "shutdown_system":
+                            logger.info("Routing: shutdown_system")
+                            return ("shutdown", {"_streamed_text": full_text})
+
+                        elif tool_name == "get_current_time":
+                            from datetime import datetime
+
+                            now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+                            logger.info("Routing: get_current_time → %s", now)
+                            return ("conversation", {"text": f"It's {now}."})
+
+            # No tool use — pure conversation response (already streamed)
+            if not full_text.strip():
+                logger.warning("process_user_input_streaming: empty response for '%s'", text[:60])
+                return ("conversation", {"text": "Sorry, I didn't catch that."})
+
+            logger.info("Routing: conversation (%d chars, streamed)", len(full_text))
+            return ("conversation", {"text": full_text.strip()})
+
+        except Exception as e:
+            logger.warning("Streaming routing failed (%s), falling back to non-streaming", e)
+            if full_text.strip():
+                # Partial response was already streamed — use what we have
+                logger.info("Returning partial streamed response (%d chars)", len(full_text))
+                return ("conversation", {"text": full_text.strip()})
+            # Nothing was streamed — safe to fall back
+            return self.process_user_input(
+                text=text,
+                frame_bytes=frame_bytes,
+                context=context,
+                language=language,
+                conversation_history=conversation_history,
+            )
+
     def _call_with_retry(self, **kwargs):
         """Call Claude API with exponential backoff on failure."""
+        caller = kwargs.pop("caller", "unknown")
         for attempt in range(MAX_RETRIES):
             try:
                 # Remove None system prompts (Anthropic doesn't accept None)
                 if kwargs.get("system") is None:
                     kwargs.pop("system", None)
+                logger.info("[api] %s: calling %s", caller, kwargs.get("model", "?"))
                 response = self._client.messages.create(**kwargs)
                 return response
             except Exception as e:
                 wait = BASE_BACKOFF * (2**attempt)
                 logger.warning(
-                    "API call failed (attempt %d/%d): %s. Retrying in %.1fs", attempt + 1, MAX_RETRIES, e, wait
+                    "API call failed [%s] (attempt %d/%d): %s. Retrying in %.1fs",
+                    caller, attempt + 1, MAX_RETRIES, e, wait,
                 )
                 time.sleep(wait)
 
-        logger.error("API call failed after %d attempts", MAX_RETRIES)
+        logger.error("API call failed after %d attempts [%s]", MAX_RETRIES, caller)
         return None
+
+    @staticmethod
+    def _log_prompt_audit(messages: list, has_image: bool, system_len: int) -> None:
+        """Log approximate token breakdown of the outgoing prompt."""
+        history_tokens = 0
+        current_text_tokens = 0
+
+        for msg in messages[:-1]:  # All but last = history
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                history_tokens += len(content) // 4
+
+        # Last message = current user message
+        if messages:
+            content = messages[-1].get("content", "")
+            if isinstance(content, str):
+                current_text_tokens += len(content) // 4
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        current_text_tokens += len(block.get("text", "")) // 4
+
+        image_tokens = 1280 if has_image else 0
+        system_tokens = system_len // 4
+        total = system_tokens + history_tokens + current_text_tokens + image_tokens
+
+        logger.info(
+            "[prompt_audit] ~%d tokens (system=%d, history=%d, text=%d, image=%d)",
+            total, system_tokens, history_tokens, current_text_tokens, image_tokens,
+        )
 
     def _track_usage(self, response, model: str) -> None:
         """Extract token counts from response and record in cost tracker."""

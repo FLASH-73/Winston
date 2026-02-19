@@ -30,6 +30,7 @@ SEGMENTS = [
     ("stt", "speech_end", "stt_done"),
     ("intent", "stt_done", "intent_done"),
     ("context", "intent_done", "context_ready"),
+    ("llm_first_token", "context_ready", "llm_first_token"),
     ("llm", "context_ready", "llm_done"),
     ("tts_queue", "llm_done", "tts_dequeued"),
     ("tts_synth", "tts_dequeued", "audio_plays"),
