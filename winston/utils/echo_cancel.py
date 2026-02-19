@@ -9,6 +9,7 @@ User speaking over TTS → energy spike above that level.
 """
 
 import logging
+import threading
 
 import numpy as np
 
@@ -41,6 +42,7 @@ class EnergyBargeInDetector:
         self._calibration_count = calibration_frames
         self._min_energy = min_energy  # absolute floor for threshold
 
+        self._lock = threading.Lock()
         self._active: bool = False
         self._calibrating: bool = False
         self._frames_seen: int = 0
@@ -50,83 +52,89 @@ class EnergyBargeInDetector:
 
     def start_calibration(self) -> None:
         """Begin calibration phase. Call when TTS starts playing."""
-        self._calibrating = True
-        self._active = True
-        self._frames_seen = 0
-        self._energy_samples = []
-        self._threshold = 0.0
-        self._consecutive_above = 0
+        with self._lock:
+            self._calibrating = True
+            self._active = True
+            self._frames_seen = 0
+            self._energy_samples = []
+            self._threshold = 0.0
+            self._consecutive_above = 0
 
     def reset(self) -> None:
         """Reset detector. Call when TTS stops."""
-        self._active = False
-        self._calibrating = False
-        self._consecutive_above = 0
+        with self._lock:
+            self._active = False
+            self._calibrating = False
+            self._consecutive_above = 0
 
     @property
     def is_active(self) -> bool:
-        return self._active
+        with self._lock:
+            return self._active
 
     @property
     def is_calibrating(self) -> bool:
-        return self._calibrating
+        with self._lock:
+            return self._calibrating
 
     @property
     def threshold(self) -> float:
-        return self._threshold
+        with self._lock:
+            return self._threshold
 
     def process(self, mic_frame: np.ndarray) -> bool:
         """Process a mic frame. Returns True if barge-in should trigger."""
-        if not self._active:
-            return False
+        with self._lock:
+            if not self._active:
+                return False
 
-        energy = float(np.sqrt(np.mean(mic_frame**2)))
+            energy = float(np.sqrt(np.mean(mic_frame**2)))
 
-        if self._calibrating:
-            # Measure TTS echo level during calibration
-            self._energy_samples.append(energy)
-            self._frames_seen += 1
-            if self._frames_seen >= self._calibration_count:
-                self._calibrating = False
-                # Use mean echo energy (more stable than peak)
-                avg_energy = sum(self._energy_samples) / len(self._energy_samples) if self._energy_samples else 0.0
-                self._threshold = max(
-                    avg_energy * self._threshold_factor,
-                    self._min_energy,
-                )
+            if self._calibrating:
+                # Measure TTS echo level during calibration
+                self._energy_samples.append(energy)
+                self._frames_seen += 1
+                if self._frames_seen >= self._calibration_count:
+                    self._calibrating = False
+                    # Use mean echo energy (more stable than peak)
+                    avg_energy = sum(self._energy_samples) / len(self._energy_samples) if self._energy_samples else 0.0
+                    self._threshold = max(
+                        avg_energy * self._threshold_factor,
+                        self._min_energy,
+                    )
+                    logger.info(
+                        "Barge-in ready: echo_avg=%.4f, threshold=%.4f (factor=%.1f)",
+                        avg_energy,
+                        self._threshold,
+                        self._threshold_factor,
+                    )
+                return False
+
+            # Detection: is this frame above threshold?
+            if energy > self._threshold:
+                self._consecutive_above += 1
+                if self._consecutive_above <= self._consecutive_trigger + 2:
+                    logger.debug(
+                        "Barge-in energy: %.4f > %.4f (%d/%d)",
+                        energy,
+                        self._threshold,
+                        self._consecutive_above,
+                        self._consecutive_trigger,
+                    )
+            else:
+                self._consecutive_above = 0  # Hard reset — no slow decay
+
+            if self._consecutive_above >= self._consecutive_trigger:
                 logger.info(
-                    "Barge-in ready: echo_avg=%.4f, threshold=%.4f (factor=%.1f)",
-                    avg_energy,
-                    self._threshold,
-                    self._threshold_factor,
-                )
-            return False
-
-        # Detection: is this frame above threshold?
-        if energy > self._threshold:
-            self._consecutive_above += 1
-            if self._consecutive_above <= self._consecutive_trigger + 2:
-                logger.debug(
-                    "Barge-in energy: %.4f > %.4f (%d/%d)",
+                    "BARGE-IN TRIGGERED (energy=%.4f, threshold=%.4f, ratio=%.1fx)",
                     energy,
                     self._threshold,
-                    self._consecutive_above,
-                    self._consecutive_trigger,
+                    energy / max(self._threshold, 1e-8),
                 )
-        else:
-            self._consecutive_above = 0  # Hard reset — no slow decay
+                self._consecutive_above = 0
+                return True
 
-        if self._consecutive_above >= self._consecutive_trigger:
-            logger.info(
-                "BARGE-IN TRIGGERED (energy=%.4f, threshold=%.4f, ratio=%.1fx)",
-                energy,
-                self._threshold,
-                energy / max(self._threshold, 1e-8),
-            )
-            self._consecutive_above = 0
-            return True
-
-        return False
+            return False
 
 
 def strip_echo_prefix(transcription: str, tts_text: str) -> str:

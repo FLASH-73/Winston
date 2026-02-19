@@ -1,5 +1,8 @@
 """Tests for utils/echo_cancel.py — barge-in detection and echo text rejection."""
 
+import threading
+import time
+
 import numpy as np
 from utils.echo_cancel import EnergyBargeInDetector, echo_text_overlap, strip_echo_prefix
 
@@ -137,6 +140,66 @@ class TestEnergyBargeInDetector:
         detector.reset()
         assert not detector.is_active
 
+    def test_concurrent_calibration_and_process(self):
+        """start_calibration and process can be called from different threads."""
+        detector = EnergyBargeInDetector(calibration_frames=5)
+        errors = []
+
+        def calibrate():
+            try:
+                for _ in range(100):
+                    detector.start_calibration()
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        def process_frames():
+            try:
+                frame = np.ones(1280, dtype=np.float32) * 0.05
+                for _ in range(1000):
+                    detector.process(frame)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=calibrate)
+        t2 = threading.Thread(target=process_frames)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert len(errors) == 0
+
+    def test_concurrent_reset_and_process(self):
+        """reset and process can be called from different threads."""
+        detector = EnergyBargeInDetector(calibration_frames=3)
+        errors = []
+
+        def reset_loop():
+            try:
+                for _ in range(100):
+                    detector.start_calibration()
+                    time.sleep(0.002)
+                    detector.reset()
+                    time.sleep(0.001)
+            except Exception as e:
+                errors.append(e)
+
+        def process_loop():
+            try:
+                frame = np.ones(1280, dtype=np.float32) * 0.05
+                for _ in range(1000):
+                    detector.process(frame)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=reset_loop)
+        t2 = threading.Thread(target=process_loop)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert len(errors) == 0
+
 
 class TestStripEchoPrefix:
     def test_strips_tts_words_from_beginning(self):
@@ -178,3 +241,49 @@ class TestEchoTextOverlap:
         assert echo_text_overlap("", "hello") == 0.0
         assert echo_text_overlap("hello", "") == 0.0
         assert echo_text_overlap("", "") == 0.0
+
+
+class TestWhisperHallucinationFilter:
+    """Tests for the WHISPER_HALLUCINATIONS set and prompt-leak detection."""
+
+    def test_bilingual_in_hallucinations(self):
+        from perception.audio import WHISPER_HALLUCINATIONS
+
+        assert "bilingual" in WHISPER_HALLUCINATIONS
+        assert "bilingual messages" in WHISPER_HALLUCINATIONS
+
+    def test_common_hallucinations_present(self):
+        from perception.audio import WHISPER_HALLUCINATIONS
+
+        assert "thank you" in WHISPER_HALLUCINATIONS
+        assert "thanks" in WHISPER_HALLUCINATIONS
+        assert "you" in WHISPER_HALLUCINATIONS
+        assert "the end" in WHISPER_HALLUCINATIONS
+
+    def test_hallucination_check_strips_punctuation(self):
+        """The hallucination check uses rstrip('.!?,') so 'Bilingual.' matches."""
+        from perception.audio import WHISPER_HALLUCINATIONS
+
+        text = "Bilingual."
+        cleaned = text.strip().lower().rstrip(".!?,")
+        assert cleaned in WHISPER_HALLUCINATIONS
+
+    def test_prompt_leak_catches_bilingual(self):
+        """WHISPER_PROMPT_WORDS subset check catches 'Bilingual' as prompt leak."""
+        import re
+
+        from perception.audio import WHISPER_PROMPT_WORDS
+
+        text = "Bilingual."
+        text_words = set(re.sub(r"[^\w\s]", "", text.lower()).split())
+        assert text_words.issubset(WHISPER_PROMPT_WORDS)
+
+    def test_prompt_leak_catches_multi_word(self):
+        """Multi-word prompt leaks like 'English and German' are caught."""
+        import re
+
+        from perception.audio import WHISPER_PROMPT_WORDS
+
+        text = "English and German."
+        text_words = set(re.sub(r"[^\w\s]", "", text.lower()).split())
+        assert text_words.issubset(WHISPER_PROMPT_WORDS)
