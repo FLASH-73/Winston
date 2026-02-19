@@ -28,6 +28,7 @@ class ProactiveEngine:
         self._last_speak_time = 0.0
         self._recent_observations: deque[str] = deque(maxlen=10)
         self._last_proactive_frame: Optional[np.ndarray] = None
+        self.last_usefulness_score: int = 0
 
     def should_check(self) -> bool:
         """Return True if enough time has passed since last proactive check."""
@@ -89,6 +90,7 @@ class ProactiveEngine:
         # Check if Winston should speak
         should_speak = result.get("should_speak", False)
         usefulness = result.get("usefulness_score", 0)
+        self.last_usefulness_score = usefulness
         message = result.get("message", "")
 
         from personality import get_personality

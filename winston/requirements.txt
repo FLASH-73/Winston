@@ -15,3 +15,4 @@ uvicorn[standard]>=0.20
 websockets>=11.0
 ddgs>=9.0
 groq>=0.4.1
+python-telegram-bot>=21.0

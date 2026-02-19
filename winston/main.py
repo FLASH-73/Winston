@@ -80,6 +80,8 @@ class Winston:
         # Persistent stores (initialized in start())
         self._agent_store = None
         self._notes_store = None
+        self._telegram_bot = None
+        self._telegram_notifier = None
         # All other modules created lazily in start()
 
     def start(self) -> bool:
@@ -263,6 +265,56 @@ class Winston:
 
         self.tts.speak_async(get_catchphrase("greeting", "en"))
 
+        # ── 5. Telegram bot (optional) ──────────────────────────────
+        from config import TELEGRAM_ENABLED
+
+        if TELEGRAM_ENABLED:
+            from config import TELEGRAM_ALLOWED_USERS, TELEGRAM_BOT_TOKEN
+
+            if TELEGRAM_BOT_TOKEN:
+                self._log_step("Starting Telegram bot")
+                from telegram_bot import TelegramBot
+
+                # Pass camera, STT provider, and TTS engine for new features
+                stt_provider = getattr(self.audio, "_stt_provider", None)
+
+                self._telegram_bot = TelegramBot(
+                    token=TELEGRAM_BOT_TOKEN,
+                    allowed_users=TELEGRAM_ALLOWED_USERS,
+                    llm=self.llm,
+                    memory=self.memory,
+                    cost_tracker=self.cost_tracker,
+                    notes_store=self._notes_store,
+                    agent_store=self._agent_store,
+                    state=self.state,
+                    agent_lock=self._agent_lock,
+                    camera=self.camera,
+                    stt_provider=stt_provider,
+                    tts_engine=self.tts,
+                )
+                threading.Thread(
+                    target=self._telegram_bot.start,
+                    daemon=True,
+                    name="telegram-bot",
+                ).start()
+                logger.info("Telegram bot started")
+
+                # Set up proactive Telegram notifications
+                from config import TELEGRAM_NOTIFY_PROACTIVE
+
+                if TELEGRAM_NOTIFY_PROACTIVE:
+                    from telegram_bot import TelegramNotifier
+
+                    self._telegram_notifier = TelegramNotifier(self._telegram_bot)
+                    logger.info("Telegram proactive notifier enabled")
+
+                # Register bot with dashboard for webhook support
+                from dashboard.server import set_telegram_bot
+
+                set_telegram_bot(self._telegram_bot)
+            else:
+                logger.warning("TELEGRAM_ENABLED=true but TELEGRAM_BOT_TOKEN not set")
+
         return True
 
     def run(self):
@@ -312,7 +364,14 @@ class Winston:
                 # 3. Proactive check
                 if frame_bytes and self.proactive.should_check():
                     context = self.memory.assemble_context(purpose="proactive")
-                    self.proactive.check(frame_bytes, recent_context=context)
+                    proactive_msg = self.proactive.check(frame_bytes, recent_context=context)
+
+                    # Send high-importance proactive messages to Telegram
+                    if proactive_msg and self._telegram_notifier:
+                        from config import TELEGRAM_NOTIFY_THRESHOLD
+
+                        if self.proactive.last_usefulness_score >= TELEGRAM_NOTIFY_THRESHOLD:
+                            self._telegram_notifier.notify(proactive_msg, frame_bytes)
 
                 # 4. Budget check
                 if not self.cost_tracker.check_budget():

@@ -43,6 +43,32 @@ LISTEN_TIMEOUT = 10  # Seconds to listen after wake word
 NOISE_REDUCE_ENABLED = False  # Disable noisereduce by default (can hurt quality)
 MIN_AUDIO_DURATION = 0.2  # Minimum seconds of audio to attempt transcription
 
+# Telegram Bot
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() in ("true", "1", "yes")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+_raw_telegram_users = os.getenv("TELEGRAM_ALLOWED_USERS", "")
+TELEGRAM_ALLOWED_USERS: set[int] = {
+    int(uid.strip()) for uid in _raw_telegram_users.split(",")
+    if uid.strip().isdigit()
+}
+TELEGRAM_RATE_LIMIT_PER_HOUR = 30
+TELEGRAM_MAX_CONCURRENT_AGENTS = 2
+TELEGRAM_PROGRESS_DEBOUNCE = 1.5  # seconds between progress message edits
+TELEGRAM_LONG_MESSAGE_THRESHOLD = 2000  # chars; above this → send as .txt document
+TELEGRAM_QUEUE_MAX_SIZE = 5
+TELEGRAM_NOTIFY_PROACTIVE = os.getenv("TELEGRAM_NOTIFY_PROACTIVE", "false").lower() in ("true", "1", "yes")
+TELEGRAM_NOTIFY_THRESHOLD = int(os.getenv("TELEGRAM_NOTIFY_THRESHOLD", "8"))
+TELEGRAM_VOICE_RESPONSES = os.getenv("TELEGRAM_VOICE_RESPONSES", "false").lower() in ("true", "1", "yes")
+TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")  # Empty = polling mode
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+TELEGRAM_HISTORY_FILE = "./winston_memory/telegram_history.json"
+TELEGRAM_AGENT_RATE_LIMIT_PER_HOUR = 10
+TELEGRAM_ADMIN_USER = (
+    int(_raw_telegram_users.split(",")[0].strip())
+    if _raw_telegram_users.strip() and _raw_telegram_users.split(",")[0].strip().isdigit()
+    else None
+)  # type: Optional[int]
+
 # Barge-in / Interruption
 BARGEIN_ENABLED = True  # Master switch for barge-in feature
 BARGEIN_ENERGY_THRESHOLD = 0.015  # Absolute floor for barge-in trigger (RMS) — lowered so quiet speech triggers

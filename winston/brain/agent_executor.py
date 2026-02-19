@@ -4,6 +4,7 @@ Supports both regular tools (web_search, shell, file ops) and Anthropic Computer
 (screenshot + mouse + keyboard). Uses the beta API when Computer Use is enabled.
 """
 
+import base64
 import logging
 import time
 from typing import TYPE_CHECKING, Callable, Optional
@@ -38,6 +39,7 @@ class AgentExecutor:
         max_iterations: int = 20,
         max_tokens: int = 4096,
         on_progress: Optional[Callable[[str], None]] = None,
+        on_screenshot: Optional[Callable[[bytes], None]] = None,
     ) -> Optional[str]:
         """Run the agentic loop until Claude provides a final answer.
 
@@ -47,6 +49,7 @@ class AgentExecutor:
             max_iterations: Maximum tool-use round trips.
             max_tokens: Max tokens per Claude response.
             on_progress: Optional callback for progress updates (tool names, etc.).
+            on_screenshot: Optional callback receiving PNG bytes when Computer Use takes a screenshot.
 
         Returns:
             Final findings text, or None on failure.
@@ -158,6 +161,14 @@ class AgentExecutor:
                     action = tool_use.input.get("action", "screenshot")
                     logger.info("[agent] Computer action: %s", action)
                     content_blocks = self._computer.execute(action, tool_use.input)
+                    if on_screenshot:
+                        for block in content_blocks:
+                            if block.get("type") == "image":
+                                try:
+                                    img_bytes = base64.b64decode(block["source"]["data"])
+                                    on_screenshot(img_bytes)
+                                except Exception:
+                                    pass
                     tool_results.append(
                         {
                             "type": "tool_result",

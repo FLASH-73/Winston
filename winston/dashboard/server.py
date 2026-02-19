@@ -10,6 +10,7 @@ Endpoints:
   GET  /api/cost                — Cost report details
   GET  /api/latency             — Latency tracking stats (p50/p95/avg)
   POST /api/notes               — Create a note from the dashboard
+  POST /telegram/webhook        — Telegram webhook endpoint (optional)
 """
 
 import asyncio
@@ -32,6 +33,7 @@ _memory = None
 _cost_tracker = None
 _audio = None
 _notes_store = None
+_telegram_bot = None
 
 
 def create_app(state, camera, memory=None, cost_tracker=None) -> FastAPI:
@@ -72,6 +74,12 @@ def set_notes_store(notes_store):
     """Set notes store reference for dashboard API."""
     global _notes_store
     _notes_store = notes_store
+
+
+def set_telegram_bot(bot):
+    """Set Telegram bot reference for webhook endpoint."""
+    global _telegram_bot
+    _telegram_bot = bot
 
 
 app = FastAPI(title="WINSTON Dashboard", docs_url=None, redoc_url=None)
@@ -257,6 +265,25 @@ async def trigger_listen():
         except Exception as e:
             return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
     return JSONResponse({"status": "error", "message": "Audio not available"}, status_code=503)
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Receive Telegram updates via webhook (alternative to polling)."""
+    from config import TELEGRAM_WEBHOOK_SECRET
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse({"error": "unauthorized"}, status_code=403)
+
+    if _telegram_bot and _telegram_bot._application:
+        data = await request.json()
+        from telegram import Update
+
+        update = Update.de_json(data, _telegram_bot._application.bot)
+        await _telegram_bot._application.process_update(update)
+    return JSONResponse({"ok": True})
 
 
 def start_server(application: FastAPI, port: int = 8420):

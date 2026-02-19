@@ -1,9 +1,27 @@
 """Shared fixtures and mock helpers for Winston test suite."""
 
+import sys
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Mock python-telegram-bot if not installed (CI / headless environments)
+# ---------------------------------------------------------------------------
+_TELEGRAM_MODULES = [
+    "telegram",
+    "telegram.constants",
+    "telegram.ext",
+    "telegram._update",
+]
+
+for _mod_name in _TELEGRAM_MODULES:
+    if _mod_name not in sys.modules:
+        mock = MagicMock()
+        mock.__name__ = _mod_name
+        mock.__path__ = []
+        sys.modules[_mod_name] = mock
 
 # ---------------------------------------------------------------------------
 # Mock Anthropic response objects
