@@ -90,6 +90,7 @@ class ElevenLabsBackend(TTSBackend):
                 style=self._style,
                 use_speaker_boost=True,
             ),
+            request_options={"timeout_in_seconds": 30},
         )
 
         if TTS_STREAMING_PLAYBACK:
@@ -122,6 +123,12 @@ class ElevenLabsBackend(TTSBackend):
                         on_playback_start()
                 stream_out.write(samples.reshape(-1, 1))
         finally:
+            # Close the generator immediately to release the HTTP connection.
+            # Without this, GC may delay cleanup, causing the next API call to hang.
+            try:
+                audio_stream.close()
+            except Exception:
+                pass
             if not self._interrupt_flag.is_set():
                 time.sleep(0.1)  # Let last chunk drain
             stream_out.stop()
@@ -131,9 +138,15 @@ class ElevenLabsBackend(TTSBackend):
     def _play_buffered(self, audio_stream, on_playback_start: Optional[Callable] = None) -> None:
         """Original approach: collect all chunks, then play at once."""
         audio_chunks = []
-        for chunk in audio_stream:
-            if isinstance(chunk, bytes) and len(chunk) > 0:
-                audio_chunks.append(chunk)
+        try:
+            for chunk in audio_stream:
+                if isinstance(chunk, bytes) and len(chunk) > 0:
+                    audio_chunks.append(chunk)
+        finally:
+            try:
+                audio_stream.close()
+            except Exception:
+                pass
         if not audio_chunks:
             raise RuntimeError("No audio data received from ElevenLabs")
         pcm_data = b"".join(audio_chunks)
@@ -275,6 +288,7 @@ class TTSEngine:
         """Queue text for async speech (non-blocking)."""
         if not text or not text.strip():
             return
+        logger.info("[tts] Queued: '%.80s'", text)
         self._queue.put((text, None, interaction_id))
 
     @property
@@ -318,8 +332,9 @@ class TTSEngine:
         """Mark end of streaming response. Queues a boundary marker.
 
         The worker will fire _on_speaking_stop when it processes the marker.
+        Don't clear _streaming_response_active here — the boundary marker
+        handler does it after all queued sentences have finished playing.
         """
-        self._streaming_response_active = False
         self._queue.put(("__RESPONSE_BOUNDARY__", None, None))
 
     def interrupt(self) -> None:
@@ -394,6 +409,7 @@ class TTSEngine:
                 self._interrupt_event.clear()
                 response_accumulator = ""
                 text_item, done_ev, iid = item
+                logger.info("[tts] Skipping due to interrupt: '%.80s'", text_item)
                 if done_ev is not None:
                     done_ev.set()
                 if iid:
@@ -406,6 +422,7 @@ class TTSEngine:
 
             # Handle response boundary marker (end of streaming response)
             if text == "__RESPONSE_BOUNDARY__":
+                self._streaming_response_active = False
                 with self._is_speaking_lock:
                     self._is_speaking = False
                 if self._on_speaking_stop:
@@ -434,6 +451,7 @@ class TTSEngine:
                 with self._is_speaking_lock:
                     self._is_speaking = True
                     self._speaking_start_time = time.monotonic()
+                logger.info("[tts] Speaking: '%.80s'", text)
 
                 # _on_speaking_start is deferred to on_playback_start callback
                 # so it fires AFTER HTTP download, right before sd.play()
@@ -471,6 +489,7 @@ class TTSEngine:
                     # Standalone utterance or last sentence — fire stop
                     with self._is_speaking_lock:
                         self._is_speaking = False
+                    logger.info("[tts] Done speaking")
                     if self._on_speaking_stop:
                         try:
                             self._on_speaking_stop()
