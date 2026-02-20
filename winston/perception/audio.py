@@ -193,7 +193,10 @@ class AudioListener:
 
         # 2. Open audio stream
         try:
+            from config import AUDIO_INPUT_DEVICE
+
             self._stream = sd.InputStream(
+                device=AUDIO_INPUT_DEVICE,
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="float32",

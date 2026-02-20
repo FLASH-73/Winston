@@ -15,44 +15,85 @@ logger = logging.getLogger("winston.camera")
 
 
 def _get_camera_names() -> list[str]:
-    """Get camera device names from macOS system_profiler.
+    """Get camera device names from the OS.
 
-    Returns a list of camera names in system order (matches AVFoundation indices).
-    Returns empty list on non-macOS or on failure.
+    macOS: system_profiler (matches AVFoundation indices).
+    Linux: V4L2 sysfs names from /sys/class/video4linux/videoN/name.
+    Returns empty list on failure.
     """
-    if platform.system() != "Darwin":
-        return []
-    try:
-        result = subprocess.run(
-            ["system_profiler", "SPCameraDataType"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        names = []
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            # Camera names are lines ending with ":" at 4-space indent
-            # (not 8+ space = properties like "Model ID:")
-            if stripped.endswith(":") and line.startswith("    ") and not line.startswith("        "):
-                names.append(stripped.rstrip(":"))
-        return names
-    except Exception:
-        return []
+    if platform.system() == "Darwin":
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPCameraDataType"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            names = []
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.endswith(":") and line.startswith("    ") and not line.startswith("        "):
+                    names.append(stripped.rstrip(":"))
+            return names
+        except Exception:
+            return []
+    elif platform.system() == "Linux":
+        # Read V4L2 device names from sysfs
+        import glob as glob_mod
+
+        names = {}
+        for path in sorted(glob_mod.glob("/sys/class/video4linux/video*/name")):
+            try:
+                dev_name = path.split("/")[-2]  # "video4"
+                idx = int(dev_name.replace("video", ""))
+                with open(path) as f:
+                    names[idx] = f.read().strip()
+            except (ValueError, OSError):
+                continue
+        return names  # dict[int, str] — caller uses .get(idx)
+    return []
+
+
+def _get_v4l2_device_indices() -> list[int]:
+    """Discover actual V4L2 video device indices from /dev/video*.
+
+    Returns sorted list of integers (e.g. [4, 5, 6, 10, 12]).
+    """
+    import glob as glob_mod
+
+    indices = []
+    for path in glob_mod.glob("/dev/video*"):
+        try:
+            idx = int(path.replace("/dev/video", ""))
+            indices.append(idx)
+        except ValueError:
+            continue
+    return sorted(indices)
 
 
 def list_cameras(max_index: int = 10) -> list[dict]:
-    """Enumerate available cameras by testing indices 0 through max_index.
+    """Enumerate available cameras by testing device indices.
+
+    On Linux, discovers actual V4L2 device indices from /dev/video* instead of
+    blindly probing 0-9 (devices may start at higher indices).
+    On macOS, probes indices 0 through max_index.
 
     Returns a list of dicts with keys: index, name, width, height, backend, channels, type.
     Detects color vs depth/IR cameras via test frame channel count.
     """
     names = _get_camera_names()
+
+    # Determine which indices to probe
+    if platform.system() == "Linux":
+        indices_to_probe = _get_v4l2_device_indices()
+    else:
+        indices_to_probe = list(range(max_index))
+
     cameras = []
     # Suppress OpenCV stderr spam ("camera failed to properly initialize") for missing indices
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     old_stderr = os.dup(2)
-    for i in range(max_index):
+    for i in indices_to_probe:
         os.dup2(devnull_fd, 2)  # Redirect stderr to /dev/null
         cap = cv2.VideoCapture(i)
         os.dup2(old_stderr, 2)  # Restore stderr
@@ -60,7 +101,10 @@ def list_cameras(max_index: int = 10) -> list[dict]:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             backend = cap.getBackendName()
-            name = names[i] if i < len(names) else f"Camera {i}"
+            if isinstance(names, dict):
+                name = names.get(i, f"Camera {i}")
+            else:
+                name = names[i] if i < len(names) else f"Camera {i}"
 
             # Detect color vs depth/IR via test frame
             ret, frame = cap.read()
@@ -85,9 +129,6 @@ def list_cameras(max_index: int = 10) -> list[dict]:
             cap.release()
         else:
             cap.release()
-            # Don't break on first failure — RealSense may have gaps between indices
-            if not cameras:
-                break  # Stop only if no cameras found yet (permission denied)
     os.close(devnull_fd)
     os.close(old_stderr)
     return cameras

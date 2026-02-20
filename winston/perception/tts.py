@@ -100,8 +100,11 @@ class ElevenLabsBackend(TTSBackend):
 
     def _play_streaming(self, audio_stream, on_playback_start: Optional[Callable] = None) -> None:
         """Play audio chunks as they arrive via sd.OutputStream."""
+        from config import AUDIO_OUTPUT_DEVICE
+
         self._interrupt_flag.clear()
         stream_out = sd.OutputStream(
+            device=AUDIO_OUTPUT_DEVICE,
             samplerate=self._sample_rate,
             channels=1,
             dtype="float32",
@@ -153,7 +156,9 @@ class ElevenLabsBackend(TTSBackend):
         samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
         if on_playback_start:
             on_playback_start()
-        sd.play(samples, samplerate=self._sample_rate)
+        from config import AUDIO_OUTPUT_DEVICE
+
+        sd.play(samples, samplerate=self._sample_rate, device=AUDIO_OUTPUT_DEVICE)
         sd.wait()
 
     def interrupt(self) -> None:

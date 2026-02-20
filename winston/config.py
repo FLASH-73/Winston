@@ -27,6 +27,11 @@ SMART_MODEL = "claude-sonnet-4-5-20250929"  # Deep analysis, on-demand
 #   CAMERA_SOURCE = "http://192.168.1.50:8080/garage"       # MJPEG stream
 CAMERA_SOURCE = None
 CAMERA_INDEX = 0  # Fallback index when interactive selection finds nothing
+
+# Audio devices (sounddevice index, or None for system default)
+# Run `python -m sounddevice` to list available devices and their indices.
+AUDIO_INPUT_DEVICE = int(os.getenv("AUDIO_INPUT_DEVICE")) if os.getenv("AUDIO_INPUT_DEVICE") else None
+AUDIO_OUTPUT_DEVICE = int(os.getenv("AUDIO_OUTPUT_DEVICE")) if os.getenv("AUDIO_OUTPUT_DEVICE") else None
 CAPTURE_INTERVAL = 3.0  # Seconds between frame captures (perception loop)
 CAMERA_ANALYSIS_INTERVAL = 30.0  # Seconds between Claude API calls for frame analysis (throttle)
 SCENE_CHANGE_THRESHOLD = 0.15  # 0-1, how much the frame must change to trigger analysis
