@@ -13,6 +13,7 @@ build/
 # Virtual environment
 venv/
 .venv/
+.venv*/
 
 # Testing & tools
 .pytest_cache/
