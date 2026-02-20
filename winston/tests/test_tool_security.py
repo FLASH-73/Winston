@@ -115,7 +115,8 @@ class TestShellCommandAllowing(unittest.TestCase):
 
     def test_shell_allows_uname(self):
         result = _run_shell_command_safe({"command": "uname -a"})
-        self.assertIn("Darwin", result)
+        import platform
+        self.assertIn(platform.system(), result)
 
 
 class TestShellOutputLimits(unittest.TestCase):

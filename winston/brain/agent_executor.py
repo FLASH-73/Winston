@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from brain.agent_tools import ToolRegistry
 
 if TYPE_CHECKING:
-    from brain.computer_use import MacOSComputerController
+    from brain.computer_use import ComputerController
 
 logger = logging.getLogger("winston.agent")
 
@@ -25,7 +25,7 @@ class AgentExecutor:
         client,
         cost_tracker,
         tool_registry: ToolRegistry,
-        computer_controller: Optional["MacOSComputerController"] = None,
+        computer_controller: Optional["ComputerController"] = None,
     ):
         self._client = client  # anthropic.Anthropic instance
         self._cost_tracker = cost_tracker

@@ -1382,9 +1382,9 @@ class TelegramBot:
             registry = create_default_registry()
             computer = None
             if COMPUTER_USE_ENABLED:
-                from brain.computer_use import MacOSComputerController
+                from brain.computer_use import ComputerController
 
-                computer = MacOSComputerController(
+                computer = ComputerController(
                     display_width=COMPUTER_USE_DISPLAY_WIDTH,
                     display_height=COMPUTER_USE_DISPLAY_HEIGHT,
                 )
