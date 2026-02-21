@@ -194,7 +194,7 @@ COMPUTER_USE_DISPLAY_HEIGHT = 800  # Logical display height Claude sees
 COMPUTER_USE_BETA = "computer-use-2025-11-24"  # Beta version for Opus 4.6
 
 # Cost Control
-MAX_DAILY_COST_USD = 2.00  # Daily API cost cap
+MAX_DAILY_COST_USD = 7.00  # Daily API cost cap
 FAST_INPUT_COST_PER_M = 1.00  # $/1M input tokens for Haiku
 FAST_OUTPUT_COST_PER_M = 5.00  # $/1M output tokens for Haiku
 SMART_INPUT_COST_PER_M = 3.00  # $/1M input tokens for Sonnet
