@@ -395,6 +395,24 @@ class AudioListener:
     def music_mode(self) -> bool:
         return self._music_mode
 
+    def measure_ambient_noise(self, duration: float = 3.0) -> float:
+        """Measure ambient noise level for threshold calibration."""
+        import time
+
+        levels = []
+        start = time.time()
+        while time.time() - start < duration:
+            levels.append(self._current_audio_level)
+            time.sleep(0.05)
+        if levels:
+            avg = sum(levels) / len(levels)
+            logger.info(
+                "Ambient noise: avg=%.4f, max=%.4f, samples=%d",
+                avg, max(levels), len(levels),
+            )
+            return avg
+        return 0.0
+
     def trigger_listen(self):
         """Manually trigger listen mode (dashboard button fallback).
 

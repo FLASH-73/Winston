@@ -3,7 +3,10 @@ import hashlib
 import json
 import logging
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
+
+# Type for frame data: single frame or labeled multi-frame sequence
+FrameInput = Union[bytes, list[tuple[str, bytes]]]
 
 from config import (
     ANTHROPIC_API_KEY,
@@ -26,9 +29,10 @@ ROUTING_TOOLS = [
         "name": "delegate_to_agent",
         "description": (
             "Delegate a task to the autonomous agent that can control the computer. "
-            "Use when the user wants you to DO something: open files/URLs/apps, "
-            "search the web and display results, navigate documents, investigate code, "
-            "control applications, or any action requiring computer interaction."
+            "Use ONLY when the user wants you to physically interact with the screen: "
+            "open apps, click UI elements, type into fields, navigate documents, "
+            "manipulate files on their machine. Do NOT use for web research or reading repos — "
+            "use do_research instead."
         ),
         "input_schema": {
             "type": "object",
@@ -36,6 +40,25 @@ ROUTING_TOOLS = [
                 "task": {
                     "type": "string",
                     "description": "Clear description of what to do, including any specifics the user mentioned",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "do_research",
+        "description": (
+            "Research a topic in the background. Use for: looking up information, "
+            "investigating repos, finding documentation, web research, checking "
+            "what's new with a project. Runs in the background — user can keep chatting. "
+            "Do NOT use delegate_to_agent for research tasks."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "What to research — be specific about what info to find",
                 },
             },
             "required": ["task"],
@@ -77,6 +100,57 @@ ROUTING_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "send_voice_response",
+        "description": (
+            "Send the response as a Telegram voice message instead of text. "
+            "ONLY use this when the user explicitly asks for audio, a voice message, "
+            "a voice note, or to 'speak' / 'say it out loud' / 'sprich mit mir'. "
+            "Default is ALWAYS text — never use this unless explicitly requested."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The response text to convert to speech and send as voice",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "camera_request",
+        "description": (
+            "Send workshop camera content via Telegram: a live photo, a short video clip "
+            "of recent seconds, or a sped-up timelapse of recent hours. "
+            "Use when the user wants to see the workshop, asks for a photo/snapshot, "
+            "a clip/video, or a timelapse. Works in English and German."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request_type": {
+                    "type": "string",
+                    "enum": ["snapshot", "clip", "timelapse"],
+                    "description": (
+                        "snapshot = single photo, "
+                        "clip = short video of last N seconds, "
+                        "timelapse = sped-up video of last N hours"
+                    ),
+                },
+                "parameter": {
+                    "type": "number",
+                    "description": (
+                        "For clip: duration in seconds (default 15, max 60). "
+                        "For timelapse: hours to cover (default 2, max 8). "
+                        "Omit for snapshot."
+                    ),
+                },
+            },
+            "required": ["request_type"],
         },
     },
 ]
@@ -422,13 +496,15 @@ class ClaudeClient:
         prompt: str,
         system_prompt: str = "",
         max_tokens: int = 300,
+        model: str = None,
     ) -> Optional[str]:
         """Text-only call for internal tasks (summarization, fact extraction).
 
-        No image, cheap. Used by the memory system.
+        No image, cheap by default (Haiku). Pass model=SMART_MODEL for higher quality.
         """
+        use_model = model or FAST_MODEL
         response = self._call_with_retry(
-            model=FAST_MODEL,
+            model=use_model,
             max_tokens=max_tokens,
             system=system_prompt if system_prompt else None,
             messages=[{"role": "user", "content": prompt}],
@@ -437,7 +513,7 @@ class ClaudeClient:
         if response is None:
             return None
 
-        self._track_usage(response, FAST_MODEL)
+        self._track_usage(response, use_model)
         text = self._safe_response_text(response)
         if not text:
             logger.warning(
@@ -542,6 +618,45 @@ class ClaudeClient:
 
         return False
 
+    @staticmethod
+    def _build_image_content(frame_input: "FrameInput") -> tuple[list[dict], int]:
+        """Convert frame input to Claude API content blocks.
+
+        Accepts either raw bytes (single frame) or a list of (label, bytes)
+        tuples (multi-frame with temporal labels).
+
+        Returns (content_blocks, image_count).
+        """
+        blocks: list[dict] = []
+
+        if isinstance(frame_input, bytes):
+            image_b64 = base64.standard_b64encode(frame_input).decode("utf-8")
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": image_b64,
+                },
+            })
+            return blocks, 1
+
+        if isinstance(frame_input, list):
+            for label, frame_bytes in frame_input:
+                blocks.append({"type": "text", "text": label})
+                image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                })
+            return blocks, len(frame_input)
+
+        return [], 0
+
     # ── Streaming chat ────────────────────────────────────────────────
 
     def chat_streaming(
@@ -635,7 +750,7 @@ class ClaudeClient:
     def process_user_input(
         self,
         text: str,
-        frame_bytes: Optional[bytes] = None,
+        frame_bytes: Optional[FrameInput] = None,
         context: Optional[str] = None,
         language: str = "en",
         conversation_history: Optional[list[dict]] = None,
@@ -664,18 +779,10 @@ class ClaudeClient:
             prompt = f"{text}\n\n{context}"
 
         content = []
+        image_count = 0
         if frame_bytes:
-            image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_b64,
-                    },
-                }
-            )
+            image_blocks, image_count = self._build_image_content(frame_bytes)
+            content.extend(image_blocks)
         content.append({"type": "text", "text": prompt})
 
         # Ensure proper alternation: if last history message is "user", merge
@@ -690,7 +797,7 @@ class ClaudeClient:
         if language != "en":
             system = f"IMPORTANT: Respond entirely in German (Deutsch). The user is speaking German.\n\n{system}"
 
-        self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system))
+        self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system), image_count=image_count)
 
         t_llm_start = time.time()
         response = self._call_with_retry(
@@ -720,6 +827,11 @@ class ClaudeClient:
                     logger.info("Routing: delegate_to_agent('%s')", task[:100])
                     return ("agent", {"task": task})
 
+                elif tool_name == "do_research":
+                    task = tool_input.get("task", text)
+                    logger.info("Routing: do_research('%s')", task[:100])
+                    return ("research", {"task": task})
+
                 elif tool_name == "save_note":
                     note_content = tool_input.get("content", text)
                     logger.info("Routing: save_note('%s')", note_content[:100])
@@ -735,6 +847,17 @@ class ClaudeClient:
                     now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
                     logger.info("Routing: get_current_time → %s", now)
                     return ("conversation", {"text": f"It's {now}."})
+
+                elif tool_name == "send_voice_response":
+                    voice_text = tool_input.get("text", "")
+                    logger.info("Routing: send_voice_response (%d chars)", len(voice_text))
+                    return ("conversation_voice", {"text": voice_text})
+
+                elif tool_name == "camera_request":
+                    req_type = tool_input.get("request_type", "snapshot")
+                    param = tool_input.get("parameter")
+                    logger.info("Routing: camera_request(%s, param=%s)", req_type, param)
+                    return ("camera_request", {"request_type": req_type, "parameter": param})
 
         # No tool use — extract text response
         texts = []
@@ -753,7 +876,7 @@ class ClaudeClient:
     def process_user_input_streaming(
         self,
         text: str,
-        frame_bytes: Optional[bytes] = None,
+        frame_bytes: Optional[FrameInput] = None,
         context: Optional[str] = None,
         language: str = "en",
         conversation_history: Optional[list[dict]] = None,
@@ -782,18 +905,10 @@ class ClaudeClient:
             prompt = f"{text}\n\n{context}"
 
         content = []
+        image_count = 0
         if frame_bytes:
-            image_b64 = base64.standard_b64encode(frame_bytes).decode("utf-8")
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_b64,
-                    },
-                }
-            )
+            image_blocks, image_count = self._build_image_content(frame_bytes)
+            content.extend(image_blocks)
         content.append({"type": "text", "text": prompt})
 
         # Ensure proper alternation: if last history message is "user", merge
@@ -822,7 +937,7 @@ class ClaudeClient:
             first_token_logged = False
             chunker = SentenceChunker(on_sentence) if on_sentence else None
 
-            self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system))
+            self._log_prompt_audit(messages, has_image=frame_bytes is not None, system_len=len(system), image_count=image_count)
             logger.info("[api] routing_streaming: calling %s", FAST_MODEL)
             with self._client.messages.stream(**kwargs) as stream:
                 for delta in stream.text_stream:
@@ -863,6 +978,11 @@ class ClaudeClient:
                             logger.info("Routing: delegate_to_agent('%s')", task[:100])
                             return ("agent", {"task": task, "_streamed_text": full_text})
 
+                        elif tool_name == "do_research":
+                            task = tool_input.get("task", text)
+                            logger.info("Routing: do_research('%s')", task[:100])
+                            return ("research", {"task": task, "_streamed_text": full_text})
+
                         elif tool_name == "save_note":
                             note_content = tool_input.get("content", text)
                             logger.info("Routing: save_note('%s')", note_content[:100])
@@ -878,6 +998,11 @@ class ClaudeClient:
                             now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
                             logger.info("Routing: get_current_time → %s", now)
                             return ("conversation", {"text": f"It's {now}."})
+
+                        elif tool_name == "send_voice_response":
+                            voice_text = tool_input.get("text", "")
+                            logger.info("Routing: send_voice_response (%d chars)", len(voice_text))
+                            return ("conversation_voice", {"text": voice_text})
 
             # No tool use — pure conversation response (already streamed)
             if not full_text.strip():
@@ -925,7 +1050,7 @@ class ClaudeClient:
         return None
 
     @staticmethod
-    def _log_prompt_audit(messages: list, has_image: bool, system_len: int) -> None:
+    def _log_prompt_audit(messages: list, has_image: bool, system_len: int, image_count: int = 1) -> None:
         """Log approximate token breakdown of the outgoing prompt."""
         history_tokens = 0
         current_text_tokens = 0
@@ -945,7 +1070,7 @@ class ClaudeClient:
                     if isinstance(block, dict) and block.get("type") == "text":
                         current_text_tokens += len(block.get("text", "")) // 4
 
-        image_tokens = 1280 if has_image else 0
+        image_tokens = 1280 * image_count if has_image else 0
         system_tokens = system_len // 4
         total = system_tokens + history_tokens + current_text_tokens + image_tokens
 

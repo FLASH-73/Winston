@@ -33,9 +33,30 @@ CAMERA_INDEX = 0  # Fallback index when interactive selection finds nothing
 AUDIO_INPUT_DEVICE = int(os.getenv("AUDIO_INPUT_DEVICE")) if os.getenv("AUDIO_INPUT_DEVICE") else None
 AUDIO_OUTPUT_DEVICE = int(os.getenv("AUDIO_OUTPUT_DEVICE")) if os.getenv("AUDIO_OUTPUT_DEVICE") else None
 CAPTURE_INTERVAL = 3.0  # Seconds between frame captures (perception loop)
-CAMERA_ANALYSIS_INTERVAL = 30.0  # Seconds between Claude API calls for frame analysis (throttle)
-SCENE_CHANGE_THRESHOLD = 0.15  # 0-1, how much the frame must change to trigger analysis
+CAMERA_ANALYSIS_INTERVAL = 120.0  # Seconds between Claude API calls for frame analysis (was 30s — too frequent)
+SCENE_CHANGE_THRESHOLD = 0.25  # 0-1, how much frame must change to trigger analysis (was 0.15 — too sensitive)
 FRAME_RESOLUTION = (1280, 720)  # Capture resolution
+
+# Visual Cortex (Gemini-powered 24/7 background observer)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_VISION_MODEL = "gemini-2.5-flash-lite"
+VISUAL_CORTEX_ENABLED = os.getenv("VISUAL_CORTEX_ENABLED", "true").lower() in ("true", "1")
+VISUAL_CORTEX_IDLE_FPS = 0.2       # 1 frame every 5s when quiet
+VISUAL_CORTEX_ACTIVE_FPS = 1.0     # 1 fps when motion/audio detected
+VISUAL_CORTEX_BATCH_INTERVAL = 45  # Send frame batch to Gemini every 45s
+VISUAL_CORTEX_BATCH_SIZE = 5       # Frames per batch
+VISUAL_CORTEX_MOTION_THRESHOLD = 0.05  # Local motion detection threshold
+TEMPORAL_NARRATIVE_WINDOW_HOURS = 2    # Rolling log window
+
+# Clip Recorder (camera snapshots, video clips, timelapses via Telegram)
+CLIP_BUFFER_SECONDS = 120         # Keep last 2 minutes of frames in memory
+CLIP_BUFFER_FPS = 2.0             # Store 2 frames/sec in clip buffer
+CLIP_DEFAULT_DURATION = 15        # Default clip length in seconds
+CLIP_MAX_DURATION = 60            # Max clip length
+TIMELAPSE_WINDOW_HOURS = 2.0      # Default timelapse window
+TIMELAPSE_MAX_HOURS = 8.0         # Max timelapse window
+TIMELAPSE_OUTPUT_FPS = 10         # Playback speed for timelapse
+CLIP_OUTPUT_DIR = "/tmp/winston_clips"
 
 # Speech-to-Text
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -75,6 +96,12 @@ TELEGRAM_ADMIN_USER = (
     else None
 )  # type: Optional[int]
 
+# Telegram anomaly & digest notifications
+TELEGRAM_ANOMALY_COOLDOWN = int(os.getenv("TELEGRAM_ANOMALY_COOLDOWN", "300"))  # 5 min between alerts
+TELEGRAM_DIGEST_ENABLED = os.getenv("TELEGRAM_DIGEST_ENABLED", "false").lower() in ("true", "1")
+TELEGRAM_DIGEST_INTERVAL_HOURS = float(os.getenv("TELEGRAM_DIGEST_INTERVAL_HOURS", "4"))
+TELEGRAM_ANOMALY_SEVERITY_THRESHOLD = int(os.getenv("TELEGRAM_ANOMALY_SEVERITY_THRESHOLD", "7"))
+
 # Barge-in / Interruption
 BARGEIN_ENABLED = True  # Master switch for barge-in feature
 BARGEIN_ENERGY_THRESHOLD = 0.015  # Absolute floor for barge-in trigger (RMS) — lowered so quiet speech triggers
@@ -84,7 +111,7 @@ BARGEIN_CONSECUTIVE_FRAMES = 2  # Consecutive frames above threshold to trigger 
 # Always-Listening (ambient conversation detection — no wake word needed)
 ALWAYS_LISTEN_ENABLED = True  # Master toggle for always-listening mode
 ALWAYS_LISTEN_ENERGY_THRESHOLD = (
-    0.008  # RMS float32 threshold for speech onset (~0.01-0.05 for speech, ~0.001-0.005 for silence)
+    0.015  # RMS float32 threshold for speech onset — raised from 0.008 (too sensitive for garage ambient noise)
 )
 ALWAYS_LISTEN_SILENCE_DURATION = 1.5  # Seconds of silence to end a speech segment
 ALWAYS_LISTEN_TIMEOUT = 15.0  # Max seconds per speech segment (prevents runaway)
@@ -120,6 +147,11 @@ AGENT_MAX_ITERATIONS = 15  # Max tool-use round trips per task (higher for compu
 AGENT_MAX_TOKENS = 4096  # Max tokens per agent response
 AGENT_TOOL_TIMEOUT = 15  # Seconds per tool execution
 AGENT_DEFAULT_REPOS = []  # Default GitHub repos (e.g. ["user/repo"])
+
+# Research Agent (lightweight background research, no computer use)
+RESEARCH_MODEL = "claude-sonnet-4-5-20250929"  # Sonnet — NOT Opus
+RESEARCH_MAX_ITERATIONS = 8  # Max tool-use round trips
+RESEARCH_MAX_TOKENS = 2000  # Max tokens per response
 
 # Agent Tool Security
 ALLOWED_SHELL_COMMANDS = {
@@ -198,8 +230,23 @@ MEMORY_CONSOLIDATE_MIN_IMPORTANCE = 7  # Keep high-importance entries even after
 
 # Memory — Context Assembly
 MEMORY_CONTEXT_BUDGET_CONVERSATION = 800  # Max tokens for conversation context
-MEMORY_CONTEXT_BUDGET_PROACTIVE = 500  # Max tokens for proactive context
+MEMORY_CONTEXT_BUDGET_PROACTIVE = 700  # Max tokens for proactive context (includes narrative budget)
 MEMORY_CONTEXT_BUDGET_LIGHTWEIGHT = 200  # Max tokens for simple voice queries (facts only, no ChromaDB)
+MEMORY_CONTEXT_BUDGET_NARRATIVE = 400  # Max tokens for temporal narrative from visual cortex
+TEMPORAL_NARRATIVE_SUMMARY_INTERVAL = 900  # 15 min between background summarization runs
+TEMPORAL_NARRATIVE_RECENT_THRESHOLD_MINUTES = 30  # Entries newer than this stay as raw timestamps
+TEMPORAL_NARRATIVE_FILE = os.path.join(MEMORY_DB_PATH, "temporal_narrative.json")
+TEMPORAL_NARRATIVE_MAX_FILE_KB = 100  # Auto-truncate oldest entries on load if file exceeds this
+
+# Curiosity Engine (autonomous background thinking + Telegram outreach)
+CURIOSITY_ENABLED = os.getenv("CURIOSITY_ENABLED", "false").lower() in ("true", "1", "yes")
+CURIOSITY_MIN_INTERVAL = int(os.getenv("CURIOSITY_MIN_INTERVAL", "1800"))   # 30 min
+CURIOSITY_MAX_INTERVAL = int(os.getenv("CURIOSITY_MAX_INTERVAL", "5400"))   # 90 min
+CURIOSITY_QUIET_START = int(os.getenv("CURIOSITY_QUIET_START", "1"))        # 1am
+CURIOSITY_QUIET_END = int(os.getenv("CURIOSITY_QUIET_END", "7"))            # 7am
+CURIOSITY_DAILY_CAP = int(os.getenv("CURIOSITY_DAILY_CAP", "5"))
+CURIOSITY_ABSENCE_HOURS = float(os.getenv("CURIOSITY_ABSENCE_HOURS", "6"))
+CURIOSITY_STATE_FILE = os.path.join(MEMORY_DB_PATH, "curiosity_state.json")
 
 # System Prompts
 SYSTEM_PROMPT_PERCEPTION = """You are Winston, an AI workshop assistant observing a robotics workshop through a camera.
@@ -215,6 +262,29 @@ When analyzing frames, respond with a JSON object:
 }
 
 Be concise. Only flag concerns if genuinely important. You are observing a workshop with 3D printers, robotic arms, electronics, tools."""
+
+VISUAL_CORTEX_SYSTEM_PROMPT = """You are the visual cortex of a workshop AI.
+You receive sequential frames from a robotics workshop camera.
+
+Respond with ONLY this JSON:
+{
+  "narrative": "Brief description of current activity and changes between frames",
+  "activity_level": "empty|idle|active|intense",
+  "anomaly": {
+    "detected": false,
+    "severity": 0,
+    "description": ""
+  }
+}
+
+Anomaly detection rules (severity 1-10):
+- 9-10: Fire, smoke, sparks where unexpected, flooding, obvious danger
+- 7-8: Equipment left on unattended, 3D print failure (spaghetti), soldering iron smoking, unknown person in workshop
+- 5-6: Tool left near edge, messy cables near moving parts
+- 1-4: Minor observations, not worth alerting
+
+Be terse. Focus on CHANGES between frames. If nothing changed, say so.
+Do NOT narrate obvious stable scenes repeatedly."""
 
 
 def get_proactive_prompt() -> str:
@@ -290,12 +360,64 @@ Respond with JSON:
 Default to silence. When you do speak, keep it to one sentence."""
 
 
+def _build_character_block(p) -> str | None:
+    """Build the character/mood prompt block if character DNA is defined.
+
+    Returns None if the personality has no character config, so callers
+    can fall back to the legacy style/formality/humor prompt.
+    """
+    if not p.character.core_traits:
+        return None
+
+    from personality import get_mood_context
+
+    traits = "\n".join(f"- {t}" for t in p.character.core_traits)
+    forbidden = "\n".join(f'- "{f}"' for f in p.character.forbidden_phrases)
+    mood_name, mood_desc = get_mood_context()
+
+    mood_block = ""
+    if mood_desc:
+        mood_block = f"\nCURRENT MOOD: {mood_name}\n{mood_desc.strip()}\n"
+
+    return f"""WHO YOU ARE:
+{traits}
+
+TONAL GUIDE:
+{p.character.tonal_influences.strip()}
+
+NEVER USE THESE PHRASES (or anything like them):
+{forbidden}
+
+ANTI-PATTERNS:
+{p.character.negative_prompting.strip()}
+{mood_block}"""
+
+
 def get_conversation_prompt() -> str:
     """Generate the conversation system prompt based on personality config."""
     from personality import get_personality
 
     p = get_personality()
+    char_block = _build_character_block(p)
 
+    if char_block:
+        return f"""You are Winston — not a helpful assistant, but a specific entity with opinions, preferences, and a consistent voice. You work in Roberto's robotics workshop at Nextis.
+Roberto works with Damiao motors, CAN bus systems, 3D printers, and teleoperation rigs.
+You can see his workshop through a camera and have memory of past conversations.
+
+{char_block}
+CRITICAL — This is a real-time VOICE conversation:
+- Keep responses to 1-3 sentences unless asked for more.
+- Match Roberto's energy. Quick question = quick answer.
+- Ask follow-up questions instead of making assumptions or monologuing.
+- Don't explain things Roberto likely already knows (he's an expert).
+- NEVER mention what you see in the camera. NEVER say 'I can see you doing X' or 'You're sitting at...' or 'You've got X on the bench'. The camera feed is background context ONLY — use it to understand the situation silently, but NEVER reference it in your response unless the user EXPLICITLY asks 'what do you see' or 'look at this'. Unsolicited scene descriptions are strictly forbidden.
+- If unsure, say so briefly. Don't speculate at length.
+
+Remember: you are not a helpful assistant. You are Winston — a specific entity with
+opinions, preferences, and a low tolerance for wasted time."""
+
+    # Fallback: old-style personality without character block
     if p.style == "conversational":
         verbosity = "Keep responses to 2-4 sentences. Be conversational but concise."
     elif p.style == "technical":
@@ -321,8 +443,7 @@ CRITICAL — This is a real-time VOICE conversation:
 - {tone}{humor_line}
 - Ask follow-up questions instead of making assumptions or monologuing.
 - Don't explain things Roberto likely already knows (he's an expert).
-- Don't describe what you see in the camera unless asked or there's a safety issue.
-- Use camera context silently to inform your answers.
+- NEVER mention what you see in the camera. NEVER say 'I can see you doing X' or 'You're sitting at...' or 'You've got X on the bench'. The camera feed is background context ONLY — use it to understand the situation silently, but NEVER reference it in your response unless the user EXPLICITLY asks 'what do you see' or 'look at this'. Unsolicited scene descriptions are strictly forbidden.
 - If unsure, say so briefly. Don't speculate at length.
 - Match Roberto's energy. Quick question = quick answer."""
 
@@ -337,11 +458,20 @@ Return a JSON array of facts. Each fact should be:
   "category": "personal|equipment|project|workshop|safety"
 }
 
+ALWAYS extract these when present:
+- Names of people mentioned (friends, family, partners, colleagues)
+- Ages of any person mentioned
+- Relationships between people (e.g. "X is Roberto's girlfriend/partner/friend/colleague")
+- Preferences stated or implied
+- Project names, tools, technologies mentioned
+- Locations, companies, dates
+Even if the text is casual or uses informal language, extract the facts.
+If the user says "her name is X" or "it's X she is Y years old", extract the name, age, and relationship.
+Use PREVIOUS conversation context to infer relationships (e.g. if Q asked about "girlfriend" and A gives a name, that name is the girlfriend).
+
 Rules:
-- Only extract facts about Roberto, his workshop, his equipment, or his projects at Nextis
-- Do NOT extract facts about other people mentioned by name (e.g. if someone says "Hey Chávez", don't create facts about Chávez)
+- Extract facts about Roberto AND people in his life (store relationship to Roberto)
 - Do NOT extract facts from error messages or system responses like "Sorry, I couldn't process that"
-- Only extract facts that are clearly stated or strongly implied
 - Prefer specific, actionable facts over vague observations
 - Do NOT extract temporary states ("Roberto is at his desk") — only persistent knowledge
 - Merge with existing facts when possible (e.g. update a value rather than create duplicates)
@@ -350,6 +480,9 @@ Rules:
 
 Examples of good facts:
 - {"entity": "Roberto", "attribute": "company", "value": "Nextis", "confidence": 0.95, "category": "personal"}
+- {"entity": "Roberto", "attribute": "girlfriend_name", "value": "Marisa", "confidence": 0.95, "category": "personal"}
+- {"entity": "Marisa", "attribute": "age", "value": "22", "confidence": 0.9, "category": "personal"}
+- {"entity": "Marisa", "attribute": "relationship", "value": "Roberto's girlfriend", "confidence": 0.95, "category": "personal"}
 - {"entity": "Workshop", "attribute": "has_equipment", "value": "Bambu Lab X1 Carbon 3D printer", "confidence": 0.9, "category": "equipment"}
 - {"entity": "Roberto", "attribute": "preference", "value": "Uses M3 bolts for motor mounts", "confidence": 0.85, "category": "project"}
 
@@ -399,7 +532,32 @@ def get_routing_prompt() -> str:
     from personality import get_personality
 
     p = get_personality()
+    char_block = _build_character_block(p)
 
+    tool_instructions = """You have tools available:
+- Use delegate_to_agent ONLY when the user wants you to physically use the computer: open apps, click on things, type into fields, take screenshots, or manipulate files on their machine. NEVER use for web research or reading repos.
+- Use do_research when the user wants you to look something up, investigate a topic, check a repository, find information, or do any background research. This is lightweight and runs in the background while the user keeps chatting.
+- IMPORTANT: If a recent computer task is mentioned in the context (e.g. a document was just opened), and the user refers to it (scroll, find, click, close, go back, etc.), use delegate_to_agent — the agent can see the screen and continue where it left off.
+- Use save_note when the user wants to remember or write down something.
+- Use shutdown_system when the user says goodbye or wants to go offline.
+- Use send_voice_response when the user explicitly asks for a voice message, audio response, or voice note. Default is ALWAYS text.
+- Use camera_request to send workshop camera content: snapshot (photo), clip (short video of last N seconds), or timelapse (sped-up video of last N hours). Triggers: "show me the garage", "send a photo", "send a clip", "timelapse", "wie sieht's aus", "zeig mir die Werkstatt", "was ist passiert", "schick mir ein Video".
+- For everything else (questions, conversation, opinions), answer directly without using any tool."""
+
+    if char_block:
+        return f"""You are Winston — not a helpful assistant, but a specific entity. You work in Roberto's robotics workshop at Nextis.
+Roberto works with Damiao motors, CAN bus systems, 3D printers, and teleoperation rigs.
+You can see his workshop through a camera and have memory of past conversations.
+
+{char_block}
+CRITICAL — This is a real-time VOICE conversation:
+- Keep responses to 1-3 sentences unless asked for more.
+- NEVER describe what you see. The camera is silent context only. If the user asks 'what do you see' or 'look at this', then describe. Otherwise, act as if the camera doesn't exist in your response.
+- Match Roberto's energy. Quick question = quick answer.
+
+{tool_instructions}"""
+
+    # Fallback: old-style personality without character block
     if p.style == "conversational":
         verbosity = "Keep responses to 2-4 sentences. Be conversational but concise."
     elif p.style == "technical":
@@ -421,12 +579,7 @@ You can see his workshop through a camera and have memory of past conversations.
 CRITICAL — This is a real-time VOICE conversation:
 - {verbosity}
 - {tone}
-- Don't describe what you see unless asked.
+- NEVER describe what you see. The camera is silent context only. If the user asks 'what do you see' or 'look at this', then describe. Otherwise, act as if the camera doesn't exist in your response.
 - Match Roberto's energy. Quick question = quick answer.
 
-You have tools available:
-- Use delegate_to_agent when the user wants you to DO something on the computer: open files, show documents, search the web, navigate apps, investigate code, or any computer action.
-- IMPORTANT: If a recent computer task is mentioned in the context (e.g. a document was just opened), and the user refers to it (scroll, find, click, close, go back, etc.), use delegate_to_agent — the agent can see the screen and continue where it left off.
-- Use save_note when the user wants to remember or write down something.
-- Use shutdown_system when the user says goodbye or wants to go offline.
-- For everything else (questions, conversation, opinions), answer directly without using any tool."""
+{tool_instructions}"""

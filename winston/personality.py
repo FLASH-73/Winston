@@ -3,10 +3,14 @@ Personality configuration for Winston.
 
 Loads personality from YAML presets (winston/personalities/*.yaml) or uses defaults.
 Singleton pattern: call set_personality() once at startup, then get_personality() anywhere.
+Dynamic mood tracking: update_mood() / set_mood() / get_mood_context().
 """
 
 import logging
+import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +66,23 @@ class VoiceConfig:
 
 
 @dataclass
+class CharacterConfig:
+    core_traits: list[str] = field(default_factory=list)
+    forbidden_phrases: list[str] = field(default_factory=list)
+    tonal_influences: str = ""
+    negative_prompting: str = ""
+
+
+@dataclass
+class CompanionConfig:
+    """Prompts for the Curiosity Engine's Telegram companion behavior."""
+    reflect_prompt: str = ""
+    explore_prompt: str = ""
+    craft_prompt: str = ""
+    absence_prompt: str = ""
+
+
+@dataclass
 class PersonalityConfig:
     name: str = "Winston"
     style: str = "concise"  # "concise" | "conversational" | "technical"
@@ -71,10 +92,17 @@ class PersonalityConfig:
     proactive_threshold: int = 8  # 1-10, only speak if usefulness >= this
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     catchphrases: dict = field(default_factory=lambda: _DEFAULT_CATCHPHRASES)
+    character: CharacterConfig = field(default_factory=CharacterConfig)
+    companion: CompanionConfig = field(default_factory=CompanionConfig)
+    moods: dict[str, str] = field(default_factory=dict)
 
 
 # Module-level singleton
 _personality: Optional[PersonalityConfig] = None
+
+# Dynamic mood state
+_current_mood: str = "default"
+_mood_context: str = ""
 
 
 def load_personality(name_or_path: str) -> PersonalityConfig:
@@ -98,6 +126,17 @@ def load_personality(name_or_path: str) -> PersonalityConfig:
     voice_data = data.pop("voice", {})
     voice = VoiceConfig(**{k: v for k, v in voice_data.items() if k in VoiceConfig.__dataclass_fields__})
 
+    # Build CharacterConfig from nested dict (empty dict = backward compatible defaults)
+    char_data = data.pop("character", {})
+    character = CharacterConfig(**{k: v for k, v in char_data.items() if k in CharacterConfig.__dataclass_fields__})
+
+    # Build CompanionConfig from nested dict
+    companion_data = data.pop("companion", {})
+    companion = CompanionConfig(**{k: v for k, v in companion_data.items() if k in CompanionConfig.__dataclass_fields__})
+
+    # Extract moods (simple dict of mood_name -> description string)
+    moods = data.pop("moods", {})
+
     # Build catchphrases — merge with defaults so missing keys don't crash
     raw_catchphrases = data.pop("catchphrases", {})
     catchphrases = {}
@@ -110,7 +149,10 @@ def load_personality(name_or_path: str) -> PersonalityConfig:
     known_fields = PersonalityConfig.__dataclass_fields__
     config_kwargs = {k: v for k, v in data.items() if k in known_fields}
 
-    return PersonalityConfig(voice=voice, catchphrases=catchphrases, **config_kwargs)
+    return PersonalityConfig(
+        voice=voice, character=character, companion=companion,
+        moods=moods, catchphrases=catchphrases, **config_kwargs,
+    )
 
 
 def set_personality(config: PersonalityConfig) -> None:
@@ -143,3 +185,94 @@ def get_catchphrase(key: str, lang: str = "en") -> str:
     p = get_personality()
     phrases = p.catchphrases.get(lang, p.catchphrases.get("en", {}))
     return phrases.get(key, p.catchphrases.get("en", {}).get(key, key))
+
+
+# ── Dynamic mood tracking ─────────────────────────────────────────────
+
+# Single words matched with \b word boundaries to avoid substring false positives
+_EMERGENCY_WORDS = [
+    "fire", "smoke", "burn", "burning", "injury", "bleeding", "sparks",
+    "emergency", "broken", "leak", "leaking", "help",
+    # German equivalents
+    "feuer", "rauch", "brand", "verletzung", "blutung", "funken",
+    "notfall", "kaputt", "leck", "hilfe",
+]
+# Multi-word phrases matched as literal substrings (already specific enough)
+_EMERGENCY_PHRASES = [
+    "short circuit", "something is wrong", "help me",
+    "kurzschluss", "etwas stimmt nicht", "hilf mir",
+]
+_EMERGENCY_WORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _EMERGENCY_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+_emergency_set_at: float | None = None  # monotonic timestamp when emergency was set
+_EMERGENCY_AUTO_REVERT_SECONDS = 120  # auto-revert after 2 minutes
+
+
+def _narrative_has_emergency(narrative: str) -> bool:
+    """Check if narrative contains actual danger indicators (not profanity)."""
+    narrative_lower = narrative.lower()
+    if _EMERGENCY_WORD_RE.search(narrative_lower):
+        return True
+    return any(phrase in narrative_lower for phrase in _EMERGENCY_PHRASES)
+
+
+def update_mood(session_duration_min: float, narrative: str = "") -> None:
+    """Update Winston's mood based on session state. Rule-based, no API calls.
+
+    Priority: emergency > long_session > idle_night > default.
+    'success' and 'mistake' are set externally via set_mood().
+    Emergency auto-reverts after 2 minutes without continued danger signals.
+    """
+    global _current_mood, _mood_context, _emergency_set_at
+
+    p = get_personality()
+    if not p.moods:
+        return
+
+    has_emergency = _narrative_has_emergency(narrative)
+
+    if has_emergency:
+        new_mood = "emergency"
+    elif _current_mood == "emergency":
+        # Auto-revert: emergency clears after 2 min without new danger signals
+        if _emergency_set_at and (time.monotonic() - _emergency_set_at) >= _EMERGENCY_AUTO_REVERT_SECONDS:
+            new_mood = "default"
+            _emergency_set_at = None
+            logger.info("Emergency mood auto-reverted after %ds", _EMERGENCY_AUTO_REVERT_SECONDS)
+        else:
+            new_mood = "emergency"  # hold emergency until timer expires
+    elif session_duration_min >= 360:  # 6+ hours
+        new_mood = "long_session"
+    else:
+        hour = datetime.now().hour
+        is_night = hour >= 23 or hour < 5
+        is_idle = len(narrative.strip()) < 20
+        if is_night and is_idle and "idle_night" in p.moods:
+            new_mood = "idle_night"
+        else:
+            new_mood = "default"
+
+    if new_mood != _current_mood and new_mood in p.moods:
+        logger.info("Mood shift: %s -> %s", _current_mood, new_mood)
+        _current_mood = new_mood
+        _mood_context = p.moods.get(new_mood, "")
+        if new_mood == "emergency":
+            _emergency_set_at = time.monotonic()
+
+
+def set_mood(mood: str) -> None:
+    """Explicitly set mood (e.g., 'success' after a task, 'mistake' on error)."""
+    global _current_mood, _mood_context
+    p = get_personality()
+    if mood in p.moods and mood != _current_mood:
+        logger.info("Mood set: %s -> %s", _current_mood, mood)
+        _current_mood = mood
+        _mood_context = p.moods[mood]
+
+
+def get_mood_context() -> tuple[str, str]:
+    """Return (mood_name, mood_description) for the current mood."""
+    return _current_mood, _mood_context

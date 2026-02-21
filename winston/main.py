@@ -57,8 +57,10 @@ logger.info("Starting up...")
 
 # Only import lightweight modules at top level (config is just stdlib + dotenv)
 from config import (
+    ALWAYS_LISTEN_ENERGY_THRESHOLD,
     CAMERA_ANALYSIS_INTERVAL,
     CAPTURE_INTERVAL,
+    MAX_DAILY_COST_USD,
     STREAMING_ENABLED,
     SYSTEM_PROMPT_PERCEPTION,
 )
@@ -84,6 +86,10 @@ class Winston:
         self._notes_store = None
         self._telegram_bot = None
         self._telegram_notifier = None
+        self._visual_cortex = None
+        self._clip_recorder = None
+        self._curiosity_engine = None
+        self._temporal_memory = None
         # Context cache for continuation window (avoid re-assembling within 8s)
         self._cached_context: str = ""
         self._cached_context_time: float = 0.0
@@ -92,6 +98,14 @@ class Winston:
         self._last_camera_analysis_time: float = 0.0
         self._last_concern: str = ""
         self._last_concern_time: float = 0.0
+        # Anomaly notification rate limiting
+        self._last_anomaly_alert_time: float = 0.0
+        self._anomaly_alerts_this_hour: list[float] = []
+        # Periodic digest timing
+        self._last_digest_time: float = 0.0
+        # Session timing for personality mood tracking
+        self._session_start: float = time.time()
+        self._last_mood_update: float = 0.0
         # All other modules created lazily in start()
 
     def start(self) -> bool:
@@ -134,6 +148,12 @@ class Winston:
             self.state.set_module_status("camera", "error")
         set_camera(self.camera)
 
+        # ── 1b. Clip Recorder (frame buffer for snapshots/clips/timelapses) ──
+        from perception.clip_recorder import ClipRecorder
+
+        self._clip_recorder = ClipRecorder(camera=self.camera)
+        self._clip_recorder.start()
+
         # ── 2. Audio (imports sounddevice, faster-whisper deferred) ───
         self._log_step("Loading speech recognition")
         t = time.time()
@@ -151,11 +171,20 @@ class Winston:
         self.audio.set_callbacks(
             on_transcription=self._on_transcription,
             on_bargein=self._on_bargein,
-            tts_is_speaking=lambda: self.tts.is_speaking,
-            get_last_tts_text=lambda: self.tts.last_spoken_text,
+            tts_is_speaking=lambda: getattr(self, 'tts', None) is not None and self.tts.is_speaking,
+            get_last_tts_text=lambda: (getattr(self, 'tts', None) and self.tts.last_spoken_text) or "",
             on_ambient_transcription=self._on_ambient_transcription,
         )
         set_audio(self.audio)
+
+        # Measure ambient noise and warn if close to always-listen threshold
+        ambient = self.audio.measure_ambient_noise(duration=2.0)
+        if ambient > ALWAYS_LISTEN_ENERGY_THRESHOLD * 0.8:
+            logger.warning(
+                "Ambient noise (%.4f) is close to speech threshold (%.4f). "
+                "Consider raising ALWAYS_LISTEN_ENERGY_THRESHOLD to %.4f",
+                ambient, ALWAYS_LISTEN_ENERGY_THRESHOLD, ambient * 2.0,
+            )
 
         # ── 3. Memory + TTS + Claude (imports anthropic, chromadb) ──
         self._log_step("Initializing Memory, TTS, and Claude in parallel")
@@ -225,6 +254,11 @@ class Winston:
         set_memory(self.memory)
         set_cost_tracker(self.cost_tracker)
 
+        # ── 3a. Research Agent (lightweight Sonnet, no computer use) ──
+        from brain.research_agent import ResearchAgent
+
+        self.research_agent = ResearchAgent(self.llm.client, self.cost_tracker)
+
         # ── 3b. Persistent stores (agent tasks + notes) ────────────────
         from config import AGENT_TASKS_FILE, NOTES_FILE
         from utils.persistent_store import PersistentStore
@@ -241,13 +275,52 @@ class Winston:
         if saved_notes:
             self.state.set_notes(saved_notes)
 
-        # ── 4. Proactive engine (imports cv2 again — cached, instant) ─
+        # ── 4. Temporal memory + proactive engine ─────────────────────
+        from brain.temporal_memory import TemporalNarrative
+
+        self._temporal_memory = TemporalNarrative()
+
+        # Load previous session's narrative (if any)
+        self._last_session_snapshot = None
+        load_result = self._temporal_memory.load_from_disk()
+        if load_result["loaded"]:
+            if load_result["session_end_snapshot"]:
+                self._last_session_snapshot = load_result
+
         from brain.proactive import ProactiveEngine
 
-        self.proactive = ProactiveEngine(self.camera, self.llm, self.memory, self.tts)
+        self.proactive = ProactiveEngine(
+            self.camera, self.llm, self.memory, self.tts,
+            temporal_memory=self._temporal_memory,
+        )
+
+        # ── 4b. Visual Cortex (Gemini background observer) ──────────────
+        from config import GEMINI_API_KEY, VISUAL_CORTEX_ENABLED
+
+        if VISUAL_CORTEX_ENABLED and GEMINI_API_KEY:
+            self._log_step("Starting Visual Cortex (Gemini)")
+            from brain.visual_cortex import VisualCortex
+
+            self._visual_cortex = VisualCortex(
+                camera=self.camera,
+                temporal_memory=self._temporal_memory,
+                on_anomaly=self._on_visual_anomaly,
+                audio=self.audio,
+            )
+            self._visual_cortex.start()
+            from config import GEMINI_VISION_MODEL
+
+            logger.info("Visual Cortex started (Gemini %s)", GEMINI_VISION_MODEL)
+        elif VISUAL_CORTEX_ENABLED and not GEMINI_API_KEY:
+            logger.warning("VISUAL_CORTEX_ENABLED=true but GEMINI_API_KEY not set — skipping")
 
         # Background tasks
         threading.Thread(target=self._consolidate_memory, daemon=True, name="memory-consolidate").start()
+        if self._temporal_memory:
+            threading.Thread(
+                target=self._run_temporal_summarization, daemon=True,
+                name="temporal-summarizer",
+            ).start()
 
         # Quick end-to-end test: verify Claude chat returns text
         try:
@@ -271,9 +344,8 @@ class Winston:
         self._log_banner(
             f"System online. Memory: {self.memory.entry_count} episodes, {facts_count} facts. Mode: always-listening."
         )
-        from personality import get_catchphrase
-
-        self.tts.speak_async(get_catchphrase("greeting", "en"))
+        greeting = self._generate_startup_greeting()
+        self.tts.speak_async(greeting)
 
         # ── 5. Telegram bot (optional) ──────────────────────────────
         from config import TELEGRAM_ENABLED
@@ -301,6 +373,7 @@ class Winston:
                     camera=self.camera,
                     stt_provider=stt_provider,
                     tts_engine=self.tts,
+                    clip_recorder=self._clip_recorder,
                 )
                 threading.Thread(
                     target=self._telegram_bot.start,
@@ -317,6 +390,22 @@ class Winston:
 
                     self._telegram_notifier = TelegramNotifier(self._telegram_bot)
                     logger.info("Telegram proactive notifier enabled")
+
+                # ── 5b. Curiosity Engine (autonomous thinking loop) ────
+                from config import CURIOSITY_ENABLED
+
+                if CURIOSITY_ENABLED and self._telegram_notifier:
+                    from brain.curiosity import CuriosityEngine
+
+                    self._curiosity_engine = CuriosityEngine(
+                        llm=self.llm,
+                        memory=self.memory,
+                        temporal_memory=self._temporal_memory,
+                        telegram_notifier=self._telegram_notifier,
+                        cost_tracker=self.cost_tracker,
+                    )
+                    self._curiosity_engine.start()
+                    logger.info("Curiosity engine enabled")
 
                 # Register bot with dashboard for webhook support
                 from dashboard.server import set_telegram_bot
@@ -364,39 +453,51 @@ class Winston:
                 frame_bytes = self.camera.get_frame_bytes()
 
                 # 2. Scene change detection -> Flash analysis (throttled)
-                conversation_active = self.tts.is_speaking or self.audio.pipeline_state == "recording"
-                analysis_due = (time.monotonic() - self._last_camera_analysis_time) >= CAMERA_ANALYSIS_INTERVAL
-                if frame_bytes and analysis_due and not conversation_active and self.camera.scene_changed():
-                    self._last_camera_analysis_time = time.monotonic()
-                    result = self.llm.analyze_frame(
-                        frame_bytes,
-                        system_prompt=SYSTEM_PROMPT_PERCEPTION,
-                    )
-                    if result:
-                        desc = result.get("scene_description", "")
-                        self.memory.store(
-                            desc,
-                            entry_type="observation",
-                            activity=result.get("activity", ""),
+                #    Skipped when Gemini visual cortex is running (it handles vision)
+                if not (self._visual_cortex and self._visual_cortex.is_alive()):
+                    conversation_active = self.tts.is_speaking or self.audio.pipeline_state == "recording"
+                    analysis_due = (time.monotonic() - self._last_camera_analysis_time) >= CAMERA_ANALYSIS_INTERVAL
+                    if frame_bytes and analysis_due and not conversation_active and self.camera.scene_changed():
+                        self._last_camera_analysis_time = time.monotonic()
+                        result = self.llm.analyze_frame(
+                            frame_bytes,
+                            system_prompt=SYSTEM_PROMPT_PERCEPTION,
                         )
-                        if desc:
-                            self.state.add_observation(desc)
-                        self.state.set_cost(self.cost_tracker.get_daily_cost())
-                        concerns = result.get("concerns")
-                        if concerns:
-                            concern_text = str(concerns)
-                            is_repeat = (
-                                concern_text == self._last_concern
-                                and (time.monotonic() - self._last_concern_time) < 120.0
+                        if result:
+                            desc = result.get("scene_description", "")
+                            self.memory.store(
+                                desc,
+                                entry_type="observation",
+                                activity=result.get("activity", ""),
                             )
-                            if not is_repeat:
-                                logger.warning("Concern detected: %s", concerns)
-                                self._last_concern = concern_text
-                                self._last_concern_time = time.monotonic()
+                            if desc:
+                                self.state.add_observation(desc)
+                            self.state.set_cost(self.cost_tracker.get_daily_cost())
+                            concerns = result.get("concerns")
+                            if concerns:
+                                concern_text = str(concerns)
+                                is_repeat = (
+                                    concern_text == self._last_concern
+                                    and (time.monotonic() - self._last_concern_time) < 120.0
+                                )
+                                if not is_repeat:
+                                    logger.warning("Concern detected: %s", concerns)
+                                    self._last_concern = concern_text
+                                    self._last_concern_time = time.monotonic()
+
+                        # Suspend camera analysis if over 50% of daily budget
+                        if self.cost_tracker.get_daily_cost() > MAX_DAILY_COST_USD * 0.5:
+                            logger.warning("Camera analysis suspended: >50%% daily budget used")
+                            self._last_camera_analysis_time = time.monotonic() + 300  # Skip 5 min
 
                 # 3. Proactive check
                 if frame_bytes and self.proactive.should_check():
-                    context = self.memory.assemble_context(purpose="proactive")
+                    temporal_narrative = ""
+                    if self._temporal_memory:
+                        temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
+                    context = self.memory.assemble_context(
+                        purpose="proactive", temporal_narrative=temporal_narrative,
+                    )
                     proactive_msg = self.proactive.check(frame_bytes, recent_context=context)
 
                     # Send high-importance proactive messages to Telegram
@@ -406,11 +507,39 @@ class Winston:
                         if self.proactive.last_usefulness_score >= TELEGRAM_NOTIFY_THRESHOLD:
                             self._telegram_notifier.notify(proactive_msg, frame_bytes)
 
+                # 3b. Periodic workshop digest
+                from config import TELEGRAM_DIGEST_ENABLED, TELEGRAM_DIGEST_INTERVAL_HOURS
+                if (
+                    TELEGRAM_DIGEST_ENABLED
+                    and self._telegram_notifier
+                    and self._temporal_memory
+                ):
+                    digest_interval_s = TELEGRAM_DIGEST_INTERVAL_HOURS * 3600.0
+                    if (time.monotonic() - self._last_digest_time) >= digest_interval_s:
+                        narrative = self._temporal_memory.get_narrative(
+                            hours=TELEGRAM_DIGEST_INTERVAL_HOURS,
+                        )
+                        if narrative:
+                            self._telegram_notifier.send_digest(narrative, self.llm)
+                            logger.info("Workshop digest sent to Telegram")
+                        else:
+                            logger.debug("Digest skipped — no workshop activity in window")
+                        self._last_digest_time = time.monotonic()
+
                 # 4. Budget check
                 if not self.cost_tracker.check_budget():
                     self._enter_low_budget_mode()
 
-                # 5. Update latency stats for dashboard
+                # 5. Periodic mood update (every ~60s, rule-based, no API calls)
+                if (time.time() - self._last_mood_update) >= 60.0:
+                    self._last_mood_update = time.time()
+                    session_min = (time.time() - self._session_start) / 60.0
+                    narrative = self.memory.working.get_session_narrative()
+                    from personality import update_mood
+
+                    update_mood(session_min, narrative)
+
+                # 6. Update latency stats for dashboard
                 from utils.latency_tracker import LatencyTracker
 
                 lat_tracker = LatencyTracker.get()
@@ -483,6 +612,37 @@ class Winston:
 
         return True
 
+    def _build_multi_frame(self, current_frame: bytes):
+        """Build a labeled multi-frame sequence for Claude visual context.
+
+        Combines past frames from temporal_memory (Gemini-analyzed snapshots)
+        with the current live camera frame. Returns labeled sequence if past
+        frames are available, otherwise returns the single current frame.
+        """
+        past_frames = self._temporal_memory.get_recent_frames(n=2)
+
+        if not past_frames:
+            # No past frames yet (cortex just started) — single frame fallback
+            return current_frame
+
+        now = datetime.now()
+        labeled_frames = []
+
+        for ts, frame_data in past_frames:
+            elapsed = (now - ts).total_seconds()
+            if elapsed < 60:
+                label = f"[{int(elapsed)} seconds ago]"
+            elif elapsed < 3600:
+                minutes = int(elapsed / 60)
+                label = f"[{minutes} minute{'s' if minutes != 1 else ''} ago]"
+            else:
+                label = f"[{ts.strftime('%H:%M')}]"
+            labeled_frames.append((label, frame_data))
+
+        labeled_frames.append(("[Now — live camera]", current_frame))
+
+        return labeled_frames
+
     def _on_bargein(self):
         """Called when barge-in (user speech during TTS) is detected."""
         logger.info("Barge-in detected — interrupting speech")
@@ -503,6 +663,10 @@ class Winston:
 
         try:
             logger.info("[transcription] User said [%s]: '%s'", lang, text)
+
+            # Reset curiosity engine absence timer on voice interaction
+            if self._curiosity_engine:
+                self._curiosity_engine.record_activity()
 
             if not text.strip():
                 logger.info("[transcription] Empty text, ignoring")
@@ -554,18 +718,43 @@ class Winston:
                 frame_bytes = self._cached_frame_bytes if needs_image else None
                 logger.info("[transcription] Reusing cached context (%.1fs old)", time.monotonic() - self._cached_context_time)
             else:
+                # Get temporal narrative (pure in-memory read, instant)
+                temporal_narrative = ""
+                if self._temporal_memory:
+                    temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
+
                 # Fetch frame (only if visual) + context in parallel
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     if needs_image:
                         frame_future = executor.submit(self.camera.get_frame_bytes)
-                    context_future = executor.submit(self.memory.assemble_context, query=text, purpose=context_purpose)
-                    frame_bytes = frame_future.result(timeout=5) if needs_image else None
+                    context_future = executor.submit(
+                        self.memory.assemble_context,
+                        query=text,
+                        purpose=context_purpose,
+                        temporal_narrative=temporal_narrative,
+                    )
+                    live_frame = frame_future.result(timeout=5) if needs_image else None
                     context = context_future.result(timeout=5)
+
+                # Build multi-frame sequence if visual cortex is active
+                frame_bytes = None
+                if needs_image and live_frame:
+                    cortex_active = self._visual_cortex and self._visual_cortex.is_alive()
+                    if cortex_active and self._temporal_memory:
+                        frame_bytes = self._build_multi_frame(live_frame)
+                    else:
+                        frame_bytes = live_frame  # Single frame fallback
 
                 # Cache for potential continuation
                 self._cached_context = context
                 self._cached_context_time = time.monotonic()
                 self._cached_frame_bytes = frame_bytes
+
+            # Inject latest visual state as a short summary for all queries
+            if self._temporal_memory:
+                latest_state = self._temporal_memory.get_latest_state()
+                if latest_state:
+                    context = f"[Visual context: {latest_state}]\n\n{context}"
 
             # Inject recent agent result so Haiku knows about follow-ups
             recent_agent = self._get_recent_agent_result()
@@ -582,8 +771,14 @@ class Winston:
                     f'\n\n[Previous speech fragment from Roberto (moments ago)]\n"{self._last_user_utterance}"'
                 )
 
+            if isinstance(frame_bytes, list):
+                frame_desc = f"multi-frame ({len(frame_bytes)} frames)"
+            elif frame_bytes:
+                frame_desc = "single frame"
+            else:
+                frame_desc = "skipped"
             logger.info("[transcription] Frame: %s, context: %s (%.1fms)",
-                        "included" if frame_bytes else "skipped", context_purpose, (time.time() - t0) * 1000)
+                        frame_desc, context_purpose, (time.time() - t0) * 1000)
 
             # Mark context ready for latency tracking
             if interaction_id:
@@ -656,6 +851,13 @@ class Winston:
                 self._running = False
                 return
 
+            if action == "research":
+                if sentences_streamed:
+                    self.tts.interrupt()
+                self._spawn_research_task(data.get("task", text), lang)
+                tracker.finish(interaction_id)
+                return
+
             if action == "agent":
                 if sentences_streamed:
                     self.tts.interrupt()
@@ -667,6 +869,22 @@ class Winston:
                 if sentences_streamed:
                     self.tts.interrupt()
                 self._handle_note_from_intent(data.get("content", text), lang)
+                tracker.finish(interaction_id)
+                return
+
+            if action == "camera_request":
+                if sentences_streamed:
+                    self.tts.interrupt()
+                if self._telegram_bot and self._clip_recorder:
+                    from config import TELEGRAM_ADMIN_USER
+                    if TELEGRAM_ADMIN_USER:
+                        req_type = data.get("request_type", "snapshot")
+                        self.tts.speak_async("Sending that to your Telegram now.")
+                        self._telegram_bot.schedule_camera_request(TELEGRAM_ADMIN_USER, data)
+                    else:
+                        self.tts.speak_async("I don't have a Telegram user to send to.")
+                else:
+                    self.tts.speak_async("Camera requests only work through Telegram for now.")
                 tracker.finish(interaction_id)
                 return
 
@@ -693,9 +911,24 @@ class Winston:
 
                 # Extract facts from genuine conversations (skip error fallbacks)
                 if not response.startswith("Sorry"):
+                    # Grab previous exchange for context (helps infer relationships)
+                    prev_context = ""
+                    convs = self.memory.working.conversations
+                    if len(convs) >= 2:
+                        prev = convs[-2]
+                        prev_context = f"Q: {prev['question']}\nA: {prev['answer']}"
+
+                    def _safe_extract_facts(memory, text, llm, ctx):
+                        try:
+                            count = memory.extract_facts_from_text(text, llm, recent_context=ctx)
+                            if count > 0:
+                                logger.info("[facts] Extracted %d new facts", count)
+                        except Exception as e:
+                            logger.error("[facts] Extraction failed: %s", e, exc_info=True)
+
                     threading.Thread(
-                        target=self.memory.extract_facts_from_text,
-                        args=(conversation_text, self.llm),
+                        target=_safe_extract_facts,
+                        args=(self.memory, conversation_text, self.llm, prev_context),
                         daemon=True,
                         name="fact-extraction",
                     ).start()
@@ -831,6 +1064,45 @@ class Winston:
                     continue
         return None
 
+    def _spawn_research_task(self, task: str, lang: str = "en"):
+        """Spawn lightweight background research (Sonnet, no computer use)."""
+        from personality import get_catchphrase
+
+        msg = get_catchphrase("agent_starting", lang)
+        self.tts.speak_async(msg)
+        self.state.add_conversation("user", task)
+
+        temporal_narrative = ""
+        if self._temporal_memory:
+            temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
+        context = self.memory.assemble_context(
+            query=task, purpose="conversation", temporal_narrative=temporal_narrative,
+        )
+
+        def on_complete(findings: str):
+            if findings:
+                if len(findings) > 500:
+                    summary = self.llm.text_only_chat(
+                        f"Summarize these findings in 2-3 spoken sentences:\n\n{findings}",
+                        max_tokens=150,
+                    )
+                    spoken = summary or findings[:500]
+                else:
+                    spoken = findings
+                self.state.add_conversation("agent", spoken)
+                self.state.set_status("speaking")
+                self.tts.speak_async(spoken)
+                self.memory.store(
+                    f"[Research]\nQ: {task}\nFindings: {findings}",
+                    entry_type="conversation",
+                )
+                if self._telegram_notifier:
+                    text = findings[:3800] if len(findings) > 3800 else findings
+                    self._telegram_notifier.notify(f"Research complete:\n\n{text}")
+                self.state.set_cost(self.cost_tracker.get_daily_cost())
+
+        self.research_agent.run_research(task, context, on_complete)
+
     def _spawn_agent_task(self, text: str, lang: str = "en"):
         """Spawn a background agent to investigate a code problem."""
         if not self._agent_lock.acquire(blocking=False):
@@ -863,7 +1135,12 @@ class Winston:
         self.state.add_agent_task(task_record)
 
         # Assemble context for the agent (memory + recent agent result for follow-ups)
-        context = self.memory.assemble_context(query=text, purpose="conversation")
+        temporal_narrative = ""
+        if self._temporal_memory:
+            temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
+        context = self.memory.assemble_context(
+            query=text, purpose="conversation", temporal_narrative=temporal_narrative,
+        )
         recent = self._get_recent_agent_result()
         if recent:
             context += (
@@ -942,6 +1219,9 @@ class Winston:
                     entry_type="conversation",
                 )
                 self.state.set_cost(self.cost_tracker.get_daily_cost())
+                from personality import set_mood
+
+                set_mood("success")
             else:
                 self._agent_store.update_in_list(
                     "tasks",
@@ -973,9 +1253,10 @@ class Winston:
             )
             self.state.update_agent_task(task_id, "failed", f"Error: {e}")
             self.state.set_status("speaking")
-            from personality import get_catchphrase
+            from personality import get_catchphrase, set_mood
 
             self.tts.speak_async(get_catchphrase("error_investigation", "en"))
+            set_mood("mistake")
         finally:
             self._agent_lock.release()
 
@@ -1059,6 +1340,55 @@ class Winston:
 
             self.tts.speak_async(get_catchphrase("budget_warning", "en"))
 
+    def _on_visual_anomaly(self, description: str, frame_bytes: Optional[bytes] = None, severity: int = 7):
+        """Handle visual cortex anomaly detection — rate-limited Telegram alert."""
+        logger.warning("Visual anomaly (severity %d): %s", severity, description)
+
+        from config import TELEGRAM_ANOMALY_COOLDOWN, TELEGRAM_ANOMALY_SEVERITY_THRESHOLD
+
+        if severity < TELEGRAM_ANOMALY_SEVERITY_THRESHOLD:
+            logger.debug("Anomaly below severity threshold (%d < %d), skipping",
+                         severity, TELEGRAM_ANOMALY_SEVERITY_THRESHOLD)
+            return
+
+        if not self._telegram_notifier:
+            return
+
+        now = time.monotonic()
+
+        # Cooldown gate
+        if (now - self._last_anomaly_alert_time) < TELEGRAM_ANOMALY_COOLDOWN:
+            logger.debug("Anomaly alert suppressed (cooldown: %.0fs remaining)",
+                         TELEGRAM_ANOMALY_COOLDOWN - (now - self._last_anomaly_alert_time))
+            return
+
+        # Hard rate limit: max 3 alerts per hour (sliding window)
+        one_hour_ago = now - 3600.0
+        self._anomaly_alerts_this_hour = [t for t in self._anomaly_alerts_this_hour if t > one_hour_ago]
+        if len(self._anomaly_alerts_this_hour) >= 3:
+            logger.warning("Anomaly alert suppressed (3/hour rate limit reached)")
+            return
+
+        # Generate personality-flavored alert message
+        message = description
+        try:
+            flavored = self.llm.text_only_chat(
+                prompt=(
+                    f"Winston detected a workshop anomaly (severity {severity}/10): {description}\n"
+                    "Write a brief 1-sentence Telegram alert in Winston's voice. "
+                    "Be direct, no emojis, no pleasantries."
+                ),
+                max_tokens=100,
+            )
+            if flavored:
+                message = flavored
+        except Exception as e:
+            logger.debug("Personality flavoring failed, using raw description: %s", e)
+
+        self._telegram_notifier.notify_anomaly(message, frame_bytes, severity)
+        self._last_anomaly_alert_time = now
+        self._anomaly_alerts_this_hour.append(now)
+
     def _shutdown_handler(self, signum, frame):
         """Handle Ctrl+C gracefully. Second Ctrl+C forces immediate exit."""
         if not self._running:
@@ -1087,8 +1417,17 @@ class Winston:
         # Brief pause for goodbye TTS to play
         time.sleep(1.5)
 
+        if self._curiosity_engine:
+            self._curiosity_engine.stop()
+
         if hasattr(self, '_telegram_bot'):
             self._telegram_bot.stop()
+
+        if self._visual_cortex:
+            self._visual_cortex.stop()
+
+        if self._clip_recorder:
+            self._clip_recorder.stop()
 
         self.audio.stop()
         self.camera.stop()
@@ -1098,10 +1437,67 @@ class Winston:
         logger.info("\n%s", report)
         logger.info("WINSTON offline.")
 
+    def _generate_startup_greeting(self) -> str:
+        """Generate a context-aware startup greeting using the last session snapshot.
+
+        Uses a single Haiku call (< 2s) if a previous session snapshot exists.
+        Falls back to the static catchphrase on any error or if no snapshot.
+        """
+        from personality import get_catchphrase
+
+        fallback = get_catchphrase("greeting", "en")
+
+        if not self._last_session_snapshot:
+            return fallback
+
+        try:
+            snapshot_entries = self._last_session_snapshot["session_end_snapshot"]
+            saved_at = self._last_session_snapshot["saved_at"]
+
+            snapshot_text = "\n".join(
+                f"[{e['ts']}] {e['text']}" for e in snapshot_entries
+            )
+
+            # Get last session summary from ChromaDB (if available)
+            past_summaries = self.memory.episodic.get_past_summaries(n=1)
+            summary_text = past_summaries[0] if past_summaries else ""
+
+            prompt = f"Winston is coming back online. Last session ended at {saved_at}.\n"
+            if summary_text:
+                prompt += f"Last session summary: {summary_text}\n"
+            prompt += (
+                f"Last observations before shutdown:\n{snapshot_text}\n\n"
+                "Generate a brief (1-2 sentence) contextual greeting that acknowledges "
+                "what was happening. Be natural, not robotic. Example: "
+                "'Back online. Looks like you were testing the servo mounts last time.'"
+            )
+
+            greeting = self.llm.text_only_chat(prompt=prompt, max_tokens=60)
+
+            if greeting and greeting.strip():
+                logger.info("Contextual greeting: %s", greeting.strip())
+                return greeting.strip()
+
+            return fallback
+
+        except Exception as e:
+            logger.warning("Contextual greeting failed, using fallback: %s", e)
+            return fallback
+
     def _safe_shutdown_memory(self):
         """Run memory shutdown in a thread so it can be timed out."""
         try:
-            self.memory.shutdown_session(self.llm)
+            # Get temporal narrative for session summary
+            temporal_narrative = ""
+            if self._temporal_memory:
+                temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
+
+            # Save temporal narrative to disk first (fast I/O, no LLM call)
+            if self._temporal_memory:
+                self._temporal_memory.save_to_disk()
+
+            # Generate session summary (includes temporal narrative now)
+            self.memory.shutdown_session(self.llm, temporal_narrative=temporal_narrative)
         except Exception as e:
             logger.error("Session shutdown error: %s", e)
 
@@ -1113,6 +1509,18 @@ class Winston:
                 logger.info("Memory consolidation: removed %d old entries", deleted)
         except Exception as e:
             logger.error("Memory consolidation failed: %s", e)
+
+    def _run_temporal_summarization(self):
+        """Periodically compress old temporal narrative entries using Haiku."""
+        from config import TEMPORAL_NARRATIVE_SUMMARY_INTERVAL
+
+        while self._running:
+            time.sleep(TEMPORAL_NARRATIVE_SUMMARY_INTERVAL)
+            if self._temporal_memory and hasattr(self, "llm"):
+                try:
+                    self._temporal_memory.summarize_old_entries(self.llm)
+                except Exception as e:
+                    logger.error("Temporal summarization error: %s", e)
 
     def _log_step(self, message: str):
         logger.info("%s...", message)

@@ -169,6 +169,7 @@ class TelegramBot:
         camera=None,
         stt_provider=None,
         tts_engine=None,
+        clip_recorder=None,
     ):
         self._token = token
         self._allowed_users = allowed_users
@@ -182,6 +183,7 @@ class TelegramBot:
         self._camera = camera
         self._stt_provider = stt_provider
         self._tts_engine = tts_engine
+        self._clip_recorder = clip_recorder
 
         from config import (
             TELEGRAM_AGENT_RATE_LIMIT_PER_HOUR,
@@ -1165,6 +1167,9 @@ class TelegramBot:
             if response:
                 await self._send_formatted_message(update, response)
                 self._store_conversation(user_id, text, response)
+        elif action == "research":
+            task = data.get("task", text)
+            await self._spawn_research(task, chat_id, user_id, text, lang)
         elif action == "agent":
             task = data.get("task", text)
             await self._spawn_agent_with_progress(task, chat_id, user_id, text, lang)
@@ -1181,6 +1186,16 @@ class TelegramBot:
             self._state.add_note(note)
             await update.message.reply_text(f"Noted: {content.strip()}")
             self._store_conversation(user_id, text, f"Noted: {content.strip()}")
+        elif action == "conversation_voice":
+            response = data.get("text", "")
+            if response:
+                sent = await self._send_voice_response(chat_id, response)
+                if not sent:
+                    await self._send_formatted_message(update, response)
+                self._store_conversation(user_id, text, response)
+        elif action == "camera_request":
+            await self._handle_camera_request(chat_id, data)
+            self._store_conversation(user_id, text, f"[camera {data.get('request_type', 'snapshot')}]")
         elif action == "shutdown":
             await update.message.reply_text("Going offline.")
             self._store_conversation(user_id, text, "Going offline.")
@@ -1197,6 +1212,126 @@ class TelegramBot:
         except Exception as e:
             logger.error("Failed to store conversation in memory: %s", e)
         self._state.set_cost(self._cost_tracker.get_daily_cost())
+
+        # Extract facts (same pattern as voice path in main.py)
+        if not response.startswith("Sorry"):
+            # Grab previous exchange for context (helps infer relationships)
+            prev_context = ""
+            convs = self._memory.working.conversations
+            if len(convs) >= 2:
+                prev = convs[-2]
+                prev_context = f"Q: {prev['question']}\nA: {prev['answer']}"
+
+            threading.Thread(
+                target=self._safe_extract_facts,
+                args=(conversation_text, prev_context),
+                daemon=True,
+                name="fact-extraction",
+            ).start()
+
+    def _safe_extract_facts(self, text: str, recent_context: str = "") -> None:
+        """Extract semantic facts from conversation text with error logging."""
+        try:
+            count = self._memory.extract_facts_from_text(text, self._llm, recent_context=recent_context)
+            if count > 0:
+                logger.info("[facts] Extracted %d new facts from Telegram", count)
+        except Exception as e:
+            logger.error("[facts] Extraction failed: %s", e, exc_info=True)
+
+    # ── Camera Request Helpers ─────────────────────────────────
+
+    def schedule_camera_request(self, chat_id: int, data: dict):
+        """Schedule a camera request from a non-async context (e.g. voice thread)."""
+        if self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_camera_request(chat_id, data), self._loop
+            )
+
+    async def _handle_camera_request(self, chat_id: int, data: dict):
+        """Dispatch a camera_request route to snapshot/clip/timelapse."""
+        if not self._clip_recorder:
+            await self._application.bot.send_message(chat_id, "Camera recorder isn't running.")
+            return
+
+        req_type = data.get("request_type", "snapshot")
+        param = data.get("parameter")
+
+        if req_type == "snapshot":
+            await self._send_snapshot(chat_id)
+        elif req_type == "clip":
+            from config import CLIP_DEFAULT_DURATION
+            duration = param or CLIP_DEFAULT_DURATION
+            await self._send_clip(chat_id, float(duration))
+        elif req_type == "timelapse":
+            from config import TIMELAPSE_WINDOW_HOURS
+            hours = param or TIMELAPSE_WINDOW_HOURS
+            await self._send_timelapse(chat_id, float(hours))
+
+    async def _send_snapshot(self, chat_id: int):
+        """Send a live photo of the workshop."""
+        jpeg = self._clip_recorder.get_snapshot()
+        if jpeg:
+            photo = BytesIO(jpeg)
+            photo.name = "workshop.jpg"
+            await self._application.bot.send_photo(chat_id=chat_id, photo=photo)
+        else:
+            await self._application.bot.send_message(chat_id, "No frames captured yet.")
+
+    async def _send_clip(self, chat_id: int, duration: float = 15):
+        """Send a short video clip of the workshop."""
+        msg = await self._application.bot.send_message(chat_id, "Stitching clip...")
+
+        path = await asyncio.to_thread(self._clip_recorder.render_clip, duration)
+        if path:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            if size_mb > 45:
+                await self._application.bot.edit_message_text(
+                    "Clip too large. Try a shorter duration.",
+                    chat_id=chat_id, message_id=msg.message_id,
+                )
+                return
+
+            with open(path, "rb") as f:
+                await self._application.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=f"Last {int(duration)}s",
+                    supports_streaming=True,
+                )
+            try:
+                await self._application.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            os.unlink(path)
+        else:
+            await self._application.bot.edit_message_text(
+                "Not enough frames buffered yet. Try again in a minute.",
+                chat_id=chat_id, message_id=msg.message_id,
+            )
+
+    async def _send_timelapse(self, chat_id: int, hours: float = 2.0):
+        """Send a timelapse of the workshop."""
+        msg = await self._application.bot.send_message(chat_id, "Rendering timelapse...")
+
+        path = await asyncio.to_thread(self._clip_recorder.render_timelapse, hours)
+        if path:
+            with open(path, "rb") as f:
+                await self._application.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=f"Last {hours:.0f}h timelapse",
+                    supports_streaming=True,
+                )
+            try:
+                await self._application.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            os.unlink(path)
+        else:
+            await self._application.bot.edit_message_text(
+                "Not enough timelapse data yet — need at least 10 minutes of frames.",
+                chat_id=chat_id, message_id=msg.message_id,
+            )
 
     # ── Voice Note Helpers ────────────────────────────────────
 
@@ -1286,6 +1421,35 @@ class TelegramBot:
             return proc.stdout if proc.returncode == 0 else None
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
+
+    # ── Research Handling (lightweight, no computer use) ────
+
+    async def _spawn_research(
+        self, task: str, chat_id: int, user_id: int, user_text: str, lang: str
+    ):
+        """Spawn lightweight research task with simple progress."""
+        msg = await self._application.bot.send_message(
+            chat_id=chat_id, text="Researching in the background..."
+        )
+
+        context = self._memory.assemble_context(query=task, purpose="conversation")
+
+        def on_complete(findings: str):
+            result = findings or "No findings."
+            if len(result) > 3800:
+                result = result[:3800] + "\n\n[Truncated]"
+            self._state.add_conversation("agent", result[:500])
+            self._store_conversation(user_id, user_text, result[:500])
+            if self._loop and self._application:
+                asyncio.run_coroutine_threadsafe(
+                    self._safe_edit_message(chat_id, msg.message_id, result),
+                    self._loop,
+                )
+
+        from brain.research_agent import ResearchAgent
+
+        agent = ResearchAgent(self._llm.client, self._cost_tracker)
+        agent.run_research(task, context, on_complete)
 
     # ── Agent Handling with Progress ─────────────────────────
 
@@ -1657,6 +1821,9 @@ class TelegramBot:
                         chat_id=chat_id, text=chunk
                     )
                 self._store_conversation(user_id, text, response)
+        elif action == "research":
+            task = data.get("task", text)
+            await self._spawn_research(task, chat_id, user_id, text, lang)
         elif action == "agent":
             task = data.get("task", text)
             await self._spawn_agent_with_progress(task, chat_id, user_id, text, lang)
@@ -1761,3 +1928,93 @@ class TelegramNotifier:
                     "[telegram] Failed to send proactive notification to %d: %s",
                     uid, e,
                 )
+
+    # ── Anomaly alerts ────────────────────────────────────────────────
+
+    def notify_anomaly(self, message: str, frame_bytes: Optional[bytes] = None, severity: int = 7):
+        """Thread-safe anomaly alert to admin user with severity formatting."""
+        if not self._bot._loop or not self._bot._application:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_anomaly(message, frame_bytes, severity),
+            self._bot._loop,
+        )
+
+    async def _send_anomaly(self, message: str, frame_bytes: Optional[bytes], severity: int):
+        from config import TELEGRAM_ADMIN_USER
+
+        if not TELEGRAM_ADMIN_USER:
+            return
+
+        prefix = "\U0001f534 CRITICAL \u26a0\ufe0f" if severity >= 9 else "\u26a0\ufe0f"
+        caption = f"{prefix} [{severity}/10] {message}"
+
+        bot_api = self._bot._application.bot
+        try:
+            if frame_bytes:
+                await bot_api.send_photo(
+                    chat_id=TELEGRAM_ADMIN_USER,
+                    photo=BytesIO(frame_bytes),
+                    caption=caption[:1024],
+                )
+            else:
+                await bot_api.send_message(chat_id=TELEGRAM_ADMIN_USER, text=caption)
+        except Exception as e:
+            logger.error("[telegram] Failed to send anomaly alert: %s", e)
+
+    # ── Periodic digest ───────────────────────────────────────────────
+
+    def send_digest(self, narrative: str, llm):
+        """Compress narrative via Claude Haiku and send as workshop digest."""
+        if not self._bot._loop or not self._bot._application:
+            return
+        summary = llm.text_only_chat(
+            prompt=(
+                "Summarize this workshop activity log into 2-3 sentences. "
+                "Focus on what happened, any anomalies, and current state:\n\n"
+                + narrative
+            ),
+            max_tokens=200,
+        )
+        if not summary:
+            return
+
+        text = f"\U0001f4cb Workshop digest:\n{summary}"
+        asyncio.run_coroutine_threadsafe(
+            self._send_digest_message(text),
+            self._bot._loop,
+        )
+
+    async def _send_digest_message(self, text: str):
+        from config import TELEGRAM_ADMIN_USER
+
+        if not TELEGRAM_ADMIN_USER:
+            return
+        bot_api = self._bot._application.bot
+        try:
+            await bot_api.send_message(chat_id=TELEGRAM_ADMIN_USER, text=text)
+        except Exception as e:
+            logger.error("[telegram] Failed to send digest: %s", e)
+
+    # ── Curiosity engine messages ─────────────────────────────────
+
+    def send_curiosity_message(self, message: str):
+        """Send a plain curiosity message to admin user only. No prefix or formatting."""
+        if not self._bot._loop or not self._bot._application:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_curiosity(message),
+            self._bot._loop,
+        )
+
+    async def _send_curiosity(self, message: str):
+        from config import TELEGRAM_ADMIN_USER
+
+        if not TELEGRAM_ADMIN_USER:
+            return
+        try:
+            await self._bot._application.bot.send_message(
+                chat_id=TELEGRAM_ADMIN_USER, text=message
+            )
+        except Exception as e:
+            logger.error("[telegram] Curiosity message failed: %s", e)

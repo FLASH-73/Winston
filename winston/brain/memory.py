@@ -38,6 +38,7 @@ from config import (
     MEMORY_CONSOLIDATE_MIN_IMPORTANCE,
     MEMORY_CONTEXT_BUDGET_CONVERSATION,
     MEMORY_CONTEXT_BUDGET_LIGHTWEIGHT,
+    MEMORY_CONTEXT_BUDGET_NARRATIVE,
     MEMORY_CONTEXT_BUDGET_PROACTIVE,
     MEMORY_DB_PATH,
     MEMORY_DEDUP_THRESHOLD,
@@ -53,6 +54,13 @@ from config import (
 )
 
 logger = logging.getLogger("winston.memory")
+
+_TEMPORAL_QUERY_PATTERNS = re.compile(
+    r"yesterday|last session|last time|this morning|this afternoon|"
+    r"how long|when did|earlier today|"
+    r"gestern|letzte sitzung|letztes mal|heute morgen|wie lange|wann hast",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -696,13 +704,20 @@ class Memory:
 
     # ------ New three-tier interface ------
 
-    def assemble_context(self, query: str = "", purpose: str = "conversation") -> str:
+    def assemble_context(
+        self,
+        query: str = "",
+        purpose: str = "conversation",
+        temporal_narrative: str = "",
+    ) -> str:
         """Build optimal context string from all memory tiers.
 
         Args:
             query: The user's query (for semantic search). Empty for proactive.
             purpose: "conversation", "proactive", or "lightweight" — determines token budget.
                      "lightweight" skips ChromaDB search and session narrative (fast path).
+            temporal_narrative: Rolling timeline from the visual cortex (read-only).
+                     Injected as the first context section so Claude has temporal awareness.
 
         Returns:
             A formatted context string ready to include in prompts.
@@ -716,6 +731,18 @@ class Memory:
 
         sections = []
         tokens_used = 0
+
+        # 0. Temporal narrative (visual cortex timeline — highest priority, skip for lightweight)
+        if temporal_narrative and purpose != "lightweight":
+            narrative_tokens = self._estimate_tokens(temporal_narrative)
+            if narrative_tokens > MEMORY_CONTEXT_BUDGET_NARRATIVE:
+                # Truncate from the left — keep the most recent entries
+                max_chars = MEMORY_CONTEXT_BUDGET_NARRATIVE * 4
+                temporal_narrative = "..." + temporal_narrative[-(max_chars - 3):]
+                narrative_tokens = MEMORY_CONTEXT_BUDGET_NARRATIVE
+            section = f"## Recent Workshop Timeline\n{temporal_narrative}"
+            sections.append(section)
+            tokens_used += narrative_tokens
 
         # 1. Semantic facts (ALWAYS included, highest priority)
         facts_text = self.semantic.get_all_facts_as_text()
@@ -741,8 +768,10 @@ class Memory:
                 tokens_used += self._estimate_tokens(conv_context)
 
         # 4. Episodic recall (semantic search for relevant memories)
+        is_temporal_query = bool(query and _TEMPORAL_QUERY_PATTERNS.search(query))
         if query and tokens_used < budget:
-            memories = self.episodic.recall(query, n_results=5)
+            recall_n = 8 if is_temporal_query else 5
+            memories = self.episodic.recall(query, n_results=recall_n)
             if memories:
                 mem_lines = []
                 for mem in memories:
@@ -757,7 +786,8 @@ class Memory:
 
         # 5. Past session summaries (if budget allows)
         if tokens_used < budget:
-            summaries = self.episodic.get_past_summaries(n=2)
+            summary_n = 4 if is_temporal_query else 2
+            summaries = self.episodic.get_past_summaries(n=summary_n)
             if summaries:
                 for s in summaries:
                     line = f"- {s}"
@@ -772,31 +802,46 @@ class Memory:
 
         return "\n".join(sections)
 
-    def extract_facts_from_text(self, text: str, llm_client) -> int:
+    def extract_facts_from_text(self, text: str, llm_client, recent_context: str = "") -> int:
         """Use Claude Haiku to extract structured facts from text.
+
+        Args:
+            text: Current Q/A exchange to analyze.
+            llm_client: LLM client for API calls.
+            recent_context: Optional previous exchange(s) for relationship inference.
 
         Returns the number of facts extracted.
         """
         try:
+            logger.info("[facts] Attempting extraction from: %s", text[:100])
+            analysis = f"Previous context:\n{recent_context}\n\n{text}" if recent_context else text
             response = llm_client.text_only_chat(
-                prompt=f"Text to analyze:\n{text}",
+                prompt=f"Text to analyze:\n{analysis}",
                 system_prompt=SYSTEM_PROMPT_FACT_EXTRACTION,
                 max_tokens=500,
             )
             if not response:
+                logger.info("[facts] LLM returned empty response")
                 return 0
 
+            logger.info("[facts] LLM returned: %s", response[:200])
             facts = self._parse_facts_json(response)
             if facts:
-                return self.semantic.add_facts_from_json(facts)
+                count = self.semantic.add_facts_from_json(facts)
+                logger.info("[facts] Parsed %d facts, added %d", len(facts), count)
+                return count
             return 0
         except Exception as e:
-            logger.error("Fact extraction failed: %s", e)
+            logger.error("[facts] Extraction failed: %s", e, exc_info=True)
             return 0
 
-    def shutdown_session(self, llm_client) -> None:
+    def shutdown_session(self, llm_client, temporal_narrative: str = "") -> None:
         """End-of-session: generate summary, extract facts, save everything."""
         session_text = self.working.get_all_text_for_summary()
+
+        # Include visual cortex observations in the session summary
+        if temporal_narrative:
+            session_text = f"Visual observations:\n{temporal_narrative}\n\n{session_text}"
 
         if not session_text.strip():
             logger.info("No session content to summarize")
@@ -852,5 +897,5 @@ class Memory:
                 return result
             return []
         except json.JSONDecodeError:
-            logger.debug("Failed to parse facts JSON: %.100s", text)
+            logger.warning("[facts] Failed to parse JSON: %.200s", text)
             return []

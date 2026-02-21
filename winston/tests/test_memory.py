@@ -1,7 +1,13 @@
 """Tests for the three-tier memory system: Working, Episodic, Semantic, and facade."""
 
+import json
+import time
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock
+
 import chromadb
 from brain.memory import EpisodicMemory, SemanticMemory, WorkingMemory
+from brain.temporal_memory import TemporalNarrative
 from config import WORKING_MEMORY_MAX_CONVERSATIONS, WORKING_MEMORY_MAX_OBSERVATIONS
 
 # ---------------------------------------------------------------------------
@@ -165,3 +171,291 @@ def test_context_assembly_respects_budget(memory_instance, monkeypatch):
     # With 10 token budget, some sections should be omitted
     # The context should still exist (facts are always included) but be much shorter
     assert len(context) < 2000  # definitely shorter than unconstrained
+
+
+# ---------------------------------------------------------------------------
+# Temporal Narrative Integration in Context Assembly
+# ---------------------------------------------------------------------------
+
+
+def test_context_assembly_includes_temporal_narrative(memory_instance):
+    """Temporal narrative appears in assembled context with the right header."""
+    context = memory_instance.assemble_context(
+        query="motor",
+        purpose="conversation",
+        temporal_narrative="[14:02] Workshop empty. [14:15] Roberto entered.",
+    )
+    assert "## Recent Workshop Timeline" in context
+    assert "Roberto entered" in context
+
+
+def test_context_assembly_skips_narrative_for_lightweight(memory_instance):
+    """Temporal narrative is not injected for lightweight (simple query) purpose."""
+    context = memory_instance.assemble_context(
+        purpose="lightweight",
+        temporal_narrative="[14:02] Workshop empty.",
+    )
+    assert "Workshop Timeline" not in context
+
+
+def test_context_assembly_empty_narrative(memory_instance):
+    """Empty temporal narrative produces no timeline section."""
+    context = memory_instance.assemble_context(
+        query="test",
+        purpose="conversation",
+        temporal_narrative="",
+    )
+    assert "Workshop Timeline" not in context
+
+
+def test_context_assembly_truncates_long_narrative(memory_instance, monkeypatch):
+    """Narrative exceeding MEMORY_CONTEXT_BUDGET_NARRATIVE is truncated from the left."""
+    import brain.memory as mem_module
+
+    monkeypatch.setattr(mem_module, "MEMORY_CONTEXT_BUDGET_NARRATIVE", 10)  # ~40 chars
+    long_narrative = "A" * 200  # 50 tokens, exceeds the 10-token narrative budget
+    context = memory_instance.assemble_context(
+        query="test",
+        purpose="conversation",
+        temporal_narrative=long_narrative,
+    )
+    # Truncation keeps the rightmost chars with "..." prefix
+    assert "..." in context
+    # Truncated to ~40 chars (10 tokens * 4 chars/token), minus 3 for "..."
+    timeline_section = context.split("## Recent Workshop Timeline\n")[1].split("\n")[0]
+    assert len(timeline_section) <= 40
+
+
+def test_context_assembly_narrative_first(memory_instance):
+    """Temporal narrative appears BEFORE semantic facts in the context."""
+    memory_instance.semantic.add_fact(
+        "Roberto", "company", "Nextis", confidence=0.95, category="personal"
+    )
+    context = memory_instance.assemble_context(
+        query="test",
+        purpose="conversation",
+        temporal_narrative="[14:02] Workshop empty.",
+    )
+    timeline_pos = context.index("Recent Workshop Timeline")
+    facts_pos = context.index("Nextis")
+    assert timeline_pos < facts_pos
+
+
+# ---------------------------------------------------------------------------
+# TemporalNarrative Class
+# ---------------------------------------------------------------------------
+
+
+def test_temporal_narrative_get_narrative_merges_summaries_and_recent():
+    """get_narrative returns summaries + raw recent entries in chronological order."""
+    tn = TemporalNarrative()
+
+    # Add a summary for an older period
+    now = datetime.now()
+    summary_start = now - timedelta(minutes=90)
+    summary_end = now - timedelta(minutes=60)
+    tn._summaries.append(
+        (summary_start, summary_end, "Roberto worked on motor assembly.")
+    )
+
+    # Add recent raw entries (within 30 min)
+    tn.add_entry("Switched to soldering PCB.")
+    time.sleep(0.01)
+    tn.add_entry("Using fine-tip iron.")
+
+    narrative = tn.get_narrative(hours=2.0)
+
+    # Summary should appear first
+    assert "Roberto worked on motor assembly" in narrative
+    # Recent entries should appear
+    assert "soldering PCB" in narrative
+    assert "fine-tip iron" in narrative
+
+
+def test_temporal_narrative_summarize_old_entries():
+    """summarize_old_entries compresses old entries via LLM and stores a summary."""
+    tn = TemporalNarrative()
+
+    # Add entries that appear "old" (> 30 min ago)
+    old_time = datetime.now() - timedelta(minutes=45)
+    with tn._lock:
+        for i in range(6):
+            tn._entries.append(
+                (old_time + timedelta(minutes=i), f"Activity {i}")
+            )
+
+    # Mock LLM client
+    mock_llm = MagicMock()
+    mock_llm.text_only_chat.return_value = "Roberto performed activities 0-5."
+
+    result = tn.summarize_old_entries(mock_llm)
+
+    assert result is True
+    assert len(tn._summaries) == 1
+    assert "activities 0-5" in tn._summaries[0][2]
+    mock_llm.text_only_chat.assert_called_once()
+
+
+def test_temporal_narrative_summarize_skips_few_entries():
+    """summarize_old_entries returns False when fewer than 5 old entries exist."""
+    tn = TemporalNarrative()
+
+    old_time = datetime.now() - timedelta(minutes=45)
+    with tn._lock:
+        for i in range(3):
+            tn._entries.append(
+                (old_time + timedelta(minutes=i), f"Activity {i}")
+            )
+
+    mock_llm = MagicMock()
+    result = tn.summarize_old_entries(mock_llm)
+
+    assert result is False
+    mock_llm.text_only_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TemporalNarrative Persistence
+# ---------------------------------------------------------------------------
+
+
+def test_temporal_narrative_save_and_load(tmp_path):
+    """save_to_disk/load_from_disk round-trips entries and summaries."""
+    tn = TemporalNarrative()
+
+    tn.add_entry("Roberto soldering PCB")
+    tn.add_entry("Switched to motor testing")
+
+    now = datetime.now()
+    tn._summaries.append(
+        (now - timedelta(minutes=60), now - timedelta(minutes=30), "Earlier work on assembly.")
+    )
+
+    file_path = str(tmp_path / "temporal_narrative.json")
+    assert tn.save_to_disk(file_path=file_path) is True
+
+    # Load into a fresh instance
+    tn2 = TemporalNarrative()
+    result = tn2.load_from_disk(file_path=file_path)
+
+    assert result["loaded"] is True
+    assert result["entries_loaded"] == 2
+    assert len(result["session_end_snapshot"]) == 2
+    assert len(tn2._entries) == 2
+    assert len(tn2._summaries) == 1
+
+
+def test_temporal_narrative_load_filters_old_entries(tmp_path):
+    """Entries outside the time window are filtered on load."""
+    tn = TemporalNarrative()
+
+    old_time = datetime.now() - timedelta(hours=5)
+    with tn._lock:
+        tn._entries.append((old_time, "Very old entry"))
+        tn._entries.append((datetime.now(), "Recent entry"))
+
+    file_path = str(tmp_path / "temporal_narrative.json")
+    tn.save_to_disk(file_path=file_path)
+
+    tn2 = TemporalNarrative()
+    result = tn2.load_from_disk(file_path=file_path)
+
+    assert result["loaded"] is True
+    assert result["entries_loaded"] == 1
+    assert len(tn2._entries) == 1
+
+
+def test_temporal_narrative_load_missing_file(tmp_path):
+    """load_from_disk returns loaded=False when no file exists."""
+    tn = TemporalNarrative()
+    result = tn.load_from_disk(file_path=str(tmp_path / "nonexistent.json"))
+
+    assert result["loaded"] is False
+    assert result["entries_loaded"] == 0
+    assert result["session_end_snapshot"] == []
+
+
+def test_temporal_narrative_no_frames_in_json(tmp_path):
+    """Frame snapshots are NOT included in the saved JSON."""
+    tn = TemporalNarrative()
+    tn.add_entry("Test entry", frame_bytes=b"\xff\xd8\xff\xe0fake_jpeg")
+
+    file_path = str(tmp_path / "temporal_narrative.json")
+    tn.save_to_disk(file_path=file_path)
+
+    with open(file_path) as f:
+        data = json.load(f)
+
+    # No frame data in the JSON
+    assert "frame" not in json.dumps(data).lower()
+
+
+def test_temporal_narrative_session_end_snapshot():
+    """get_session_end_snapshot returns the last N entries."""
+    tn = TemporalNarrative()
+    for i in range(10):
+        tn.add_entry(f"Entry {i}")
+
+    snapshot = tn.get_session_end_snapshot(n=5)
+    assert len(snapshot) == 5
+    assert snapshot[-1][1] == "Entry 9"
+    assert snapshot[0][1] == "Entry 5"
+
+
+# ---------------------------------------------------------------------------
+# Enhanced shutdown_session with temporal narrative
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_session_includes_temporal_narrative(memory_instance):
+    """shutdown_session() includes temporal narrative in session text."""
+    mem = memory_instance
+    mem.working.add_conversation("How's the motor?", "Looks good.")
+
+    mock_llm = MagicMock()
+    mock_llm.text_only_chat.return_value = "Session summary with visual data."
+
+    mem.shutdown_session(mock_llm, temporal_narrative="[14:00] Roberto testing servo")
+
+    # The session summary call should have received text that includes the narrative
+    call_args = mock_llm.text_only_chat.call_args_list[0]
+    prompt_text = call_args.kwargs.get("prompt", call_args.args[0] if call_args.args else "")
+    assert "Visual observations" in prompt_text or "Roberto testing servo" in prompt_text
+
+
+def test_shutdown_session_backward_compatible(memory_instance):
+    """shutdown_session() works without temporal_narrative (backward compat)."""
+    mem = memory_instance
+    mem.working.add_conversation("Test", "Response")
+
+    mock_llm = MagicMock()
+    mock_llm.text_only_chat.return_value = "Basic summary."
+
+    # Should not raise
+    mem.shutdown_session(mock_llm)
+
+
+# ---------------------------------------------------------------------------
+# Temporal query detection in assemble_context
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_context_temporal_query_boosts_recall(memory_instance):
+    """Temporal queries like 'yesterday' get more episodic results."""
+    mem = memory_instance
+    for i in range(10):
+        mem.episodic.store(f"Motor test iteration {i}")
+
+    # Should not crash and should return context
+    context = mem.assemble_context(query="what did I do yesterday", purpose="conversation")
+    assert isinstance(context, str)
+
+
+def test_assemble_context_non_temporal_query(memory_instance):
+    """Non-temporal queries use standard recall budget."""
+    mem = memory_instance
+    for i in range(10):
+        mem.episodic.store(f"Motor test iteration {i}")
+
+    context = mem.assemble_context(query="how to calibrate motor", purpose="conversation")
+    assert isinstance(context, str)

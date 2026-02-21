@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from collections import deque
@@ -17,11 +18,12 @@ logger = logging.getLogger("winston.proactive")
 
 
 class ProactiveEngine:
-    def __init__(self, camera, llm, memory, tts):
+    def __init__(self, camera, llm, memory, tts, temporal_memory=None):
         self._camera = camera
         self._llm = llm
         self._memory = memory
         self._tts = tts
+        self._temporal_memory = temporal_memory
 
         self._proactive_interval = PROACTIVE_INTERVAL
         self._last_check_time = 0.0
@@ -44,6 +46,49 @@ class ProactiveEngine:
         """
         self._last_check_time = time.time()
 
+        # If temporal memory has narrative, prefer text-based analysis
+        # (visual cortex already handles vision via Gemini)
+        if self._temporal_memory:
+            narrative = self._temporal_memory.get_narrative(hours=0.5)
+            if narrative:
+                return self._check_with_narrative(narrative, recent_context)
+
+        # Fallback: original frame-based analysis
+        return self._check_with_frame(frame_bytes, recent_context)
+
+    def _check_with_narrative(self, narrative: str, recent_context: Optional[str] = None) -> Optional[str]:
+        """Proactive check using temporal narrative (no frame analysis needed)."""
+        context_parts = [f"Workshop activity log (last 30 min):\n{narrative}"]
+
+        if self._recent_observations:
+            context_parts.append("\nRecent proactive observations:")
+            for obs in self._recent_observations:
+                context_parts.append(f"- {obs}")
+
+        if recent_context:
+            context_parts.append(f"\n{recent_context}")
+
+        context_parts.append("\nGiven this workshop narrative, should Winston say something?")
+        prompt = "\n".join(context_parts)
+
+        result_text = self._llm.text_only_chat(
+            prompt=prompt,
+            system_prompt=get_proactive_prompt(),
+            max_tokens=200,
+        )
+        if not result_text:
+            return None
+
+        try:
+            result = json.loads(result_text)
+        except json.JSONDecodeError:
+            logger.debug("Narrative proactive check returned non-JSON, skipping")
+            return None
+
+        return self._evaluate_result(result)
+
+    def _check_with_frame(self, frame_bytes: bytes, recent_context: Optional[str] = None) -> Optional[str]:
+        """Original frame-based proactive check using Claude vision."""
         # Scene change gate: decode the JPEG to compare with last proactive frame
         frame_array = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame_array is None:
@@ -82,6 +127,10 @@ class ProactiveEngine:
         if result is None:
             return None
 
+        return self._evaluate_result(result)
+
+    def _evaluate_result(self, result: dict) -> Optional[str]:
+        """Shared evaluation logic for both narrative and frame-based checks."""
         # Store observation regardless of whether we speak
         scene_desc = result.get("reasoning", result.get("message", ""))
         if scene_desc:
