@@ -18,6 +18,30 @@ logger = logging.getLogger("winston.stt")
 DEFAULT_SAMPLE_RATE = 16000
 WHISPER_PROMPT = "Winston, workshop assistant. Bilingual: English and German."
 
+# Groq Whisper returns full language names ("english", "german") but the API
+# expects ISO-639-1 codes ("en", "de") for the language hint parameter.
+_LANG_NAME_TO_CODE: dict[str, str] = {
+    "english": "en", "german": "de", "french": "fr", "spanish": "es",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "russian": "ru",
+    "chinese": "zh", "japanese": "ja", "korean": "ko", "arabic": "ar",
+    "hindi": "hi", "turkish": "tr", "polish": "pl", "czech": "cs",
+    "swedish": "sv", "danish": "da", "norwegian": "no", "finnish": "fi",
+    "hungarian": "hu", "romanian": "ro", "greek": "el", "thai": "th",
+    "vietnamese": "vi", "indonesian": "id", "malay": "ms", "ukrainian": "uk",
+    "catalan": "ca", "croatian": "hr", "slovak": "sk", "slovenian": "sl",
+    "bulgarian": "bg", "serbian": "sr", "hebrew": "he", "persian": "fa",
+}
+
+
+def _normalize_language_code(lang: str) -> str:
+    """Normalize a language identifier to ISO-639-1 two-letter code."""
+    if not lang:
+        return "en"
+    lower = lang.lower().strip()
+    if len(lower) <= 3:
+        return lower  # already a code like "en", "de", "cmn"
+    return _LANG_NAME_TO_CODE.get(lower, "en")
+
 
 @dataclass
 class STTResult:
@@ -104,7 +128,7 @@ class LocalWhisperProvider:
                 initial_prompt=context_prompt or WHISPER_PROMPT,
             )
             text = " ".join(seg.text for seg in segments).strip()
-            lang = info.language if info else "en"
+            lang = _normalize_language_code(info.language if info else "en")
             duration_ms = (time.monotonic() - start) * 1000
             logger.info("Transcription [%s] (local, %.0fms, hint=%s): %s", lang, duration_ms, language_hint, text)
             return STTResult(text=text, language=lang, confidence=0.0, duration_ms=duration_ms)
@@ -146,7 +170,8 @@ class GroqWhisperProvider:
 
             response = self._client.audio.transcriptions.create(**kwargs)
             text = response.text.strip() if response.text else ""
-            lang = getattr(response, "language", "en") or "en"
+            raw_lang = getattr(response, "language", "en") or "en"
+            lang = _normalize_language_code(raw_lang)
             duration_ms = (time.monotonic() - start) * 1000
             logger.info("Transcription [%s] (groq, %.0fms, hint=%s): %s", lang, duration_ms, language_hint, text)
             return STTResult(text=text, language=lang, confidence=0.0, duration_ms=duration_ms)

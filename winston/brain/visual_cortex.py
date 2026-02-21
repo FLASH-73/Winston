@@ -65,6 +65,14 @@ class VisualCortex(threading.Thread):
         # Backoff state
         self._backoff_until: float = 0.0
 
+        # Batch interval (adjustable for presence-aware duty cycling)
+        self._batch_interval: float = VISUAL_CORTEX_BATCH_INTERVAL
+
+    def set_batch_interval_multiplier(self, multiplier: float):
+        """Scale the Gemini batch interval (e.g. 3x slower when away)."""
+        self._batch_interval = VISUAL_CORTEX_BATCH_INTERVAL * multiplier
+        logger.info("Visual cortex batch interval: %.0fs (%.1fx)", self._batch_interval, multiplier)
+
     def stop(self) -> None:
         """Signal the thread to stop gracefully."""
         self._stop_event.set()
@@ -108,7 +116,7 @@ class VisualCortex(threading.Thread):
 
                 # Check if it's time to send a batch to Gemini
                 elapsed = time.monotonic() - last_batch_time
-                if elapsed >= VISUAL_CORTEX_BATCH_INTERVAL and len(self._frame_buffer) > 0:
+                if elapsed >= self._batch_interval and len(self._frame_buffer) > 0:
                     self._analyze_batch()
                     last_batch_time = time.monotonic()
 

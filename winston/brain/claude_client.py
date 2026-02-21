@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 import time
 from typing import Callable, Optional, Union
 
@@ -22,6 +23,16 @@ logger = logging.getLogger("winston.claude")
 
 MAX_RETRIES = 2
 BASE_BACKOFF = 1.0  # max ~3s total (1s + 2s) — voice can't wait longer
+
+# Circuit breaker: stop hammering the API on fatal errors (credit exhaustion, bad key)
+FATAL_ERROR_PATTERNS = [
+    "credit balance is too low",
+    "invalid x-api-key",
+    "api key not found",
+    "account has been disabled",
+]
+_CB_INITIAL_RETRY_SECS = 300   # 5 minutes between probes
+_CB_MAX_RETRY_SECS = 1800      # cap at 30 minutes
 
 # Routing tools for process_user_input() — Haiku decides what to do
 ROUTING_TOOLS = [
@@ -344,10 +355,32 @@ class ClaudeClient:
         self._scene_cache: dict[str, tuple[dict, float]] = {}
         self._cache_ttl = 30.0
 
+        # Circuit breaker state
+        self._circuit_open = False
+        self._circuit_opened_at: float = 0.0
+        self._circuit_retry_interval: float = _CB_INITIAL_RETRY_SECS
+        self._circuit_lock = threading.Lock()
+        self._on_circuit_open: Optional[Callable[[str], None]] = None
+
     @property
     def client(self):
         """Raw Anthropic client for agent executor."""
         return self._client
+
+    def set_circuit_breaker_callback(self, callback: Callable[[str], None]) -> None:
+        """Set callback invoked once when the circuit breaker opens."""
+        self._on_circuit_open = callback
+
+    def is_available(self) -> bool:
+        """Check if the API is believed to be available.
+
+        Returns True if the circuit is closed or the retry interval has elapsed
+        (time to probe). Background subsystems should check this before calling.
+        """
+        with self._circuit_lock:
+            if not self._circuit_open:
+                return True
+            return (time.time() - self._circuit_opened_at) >= self._circuit_retry_interval
 
     def start(self) -> bool:
         """Initialize the Anthropic client and verify connectivity."""
@@ -1028,8 +1061,28 @@ class ClaudeClient:
             )
 
     def _call_with_retry(self, **kwargs):
-        """Call Claude API with exponential backoff on failure."""
+        """Call Claude API with exponential backoff and circuit breaker."""
         caller = kwargs.pop("caller", "unknown")
+
+        # Circuit breaker check
+        with self._circuit_lock:
+            if self._circuit_open:
+                elapsed = time.time() - self._circuit_opened_at
+                if elapsed < self._circuit_retry_interval:
+                    logger.debug(
+                        "Circuit breaker open, skipping API call [%s] (%ds remaining)",
+                        caller,
+                        int(self._circuit_retry_interval - elapsed),
+                    )
+                    return None
+                else:
+                    logger.info(
+                        "Circuit breaker: attempting probe call [%s] after %ds",
+                        caller,
+                        int(elapsed),
+                    )
+                    self._circuit_open = False
+
         for attempt in range(MAX_RETRIES):
             try:
                 # Remove None system prompts (Anthropic doesn't accept None)
@@ -1037,8 +1090,20 @@ class ClaudeClient:
                     kwargs.pop("system", None)
                 logger.info("[api] %s: calling %s", caller, kwargs.get("model", "?"))
                 response = self._client.messages.create(**kwargs)
+
+                # Success — reset circuit breaker if it was tripped
+                self._reset_circuit_breaker()
                 return response
             except Exception as e:
+                error_str = str(e).lower()
+                if any(pattern in error_str for pattern in FATAL_ERROR_PATTERNS):
+                    logger.error(
+                        "Fatal API error [%s]: %s — opening circuit breaker",
+                        caller, e,
+                    )
+                    self._open_circuit_breaker(str(e))
+                    return None
+
                 wait = BASE_BACKOFF * (2**attempt)
                 logger.warning(
                     "API call failed [%s] (attempt %d/%d): %s. Retrying in %.1fs",
@@ -1048,6 +1113,41 @@ class ClaudeClient:
 
         logger.error("API call failed after %d attempts [%s]", MAX_RETRIES, caller)
         return None
+
+    def _open_circuit_breaker(self, error_msg: str) -> None:
+        """Open the circuit breaker and fire the notification callback once."""
+        fire_callback = False
+        with self._circuit_lock:
+            if not self._circuit_open:
+                fire_callback = True
+                self._circuit_retry_interval = _CB_INITIAL_RETRY_SECS
+            else:
+                # Already open — double the probe interval (exponential backoff)
+                self._circuit_retry_interval = min(
+                    self._circuit_retry_interval * 2, _CB_MAX_RETRY_SECS,
+                )
+            self._circuit_open = True
+            self._circuit_opened_at = time.time()
+            logger.warning(
+                "CIRCUIT BREAKER OPEN: %s (next probe in %ds)",
+                error_msg[:200],
+                int(self._circuit_retry_interval),
+            )
+
+        if fire_callback and self._on_circuit_open:
+            try:
+                self._on_circuit_open(error_msg)
+            except Exception as cb_err:
+                logger.error("Circuit breaker callback failed: %s", cb_err)
+
+    def _reset_circuit_breaker(self) -> None:
+        """Reset circuit breaker state after a successful API call."""
+        with self._circuit_lock:
+            if self._circuit_open:
+                logger.info("Circuit breaker reset: API recovered")
+            self._circuit_open = False
+            self._circuit_opened_at = 0.0
+            self._circuit_retry_interval = _CB_INITIAL_RETRY_SECS
 
     @staticmethod
     def _log_prompt_audit(messages: list, has_image: bool, system_len: int, image_count: int = 1) -> None:

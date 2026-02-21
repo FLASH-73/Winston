@@ -21,11 +21,13 @@ from typing import Optional
 
 from config import (
     CURIOSITY_ABSENCE_HOURS,
+    CURIOSITY_COMPANION_PROMPT,
     CURIOSITY_DAILY_CAP,
     CURIOSITY_MAX_INTERVAL,
     CURIOSITY_MIN_INTERVAL,
     CURIOSITY_QUIET_END,
     CURIOSITY_QUIET_START,
+    CURIOSITY_SEARCH_ENABLED,
     CURIOSITY_STATE_FILE,
     SMART_MODEL,
 )
@@ -39,12 +41,13 @@ _TOPIC_DEDUP_HOURS = 48
 class CuriosityEngine:
     """Autonomous background loop: reflect, explore, share."""
 
-    def __init__(self, llm, memory, temporal_memory, telegram_notifier, cost_tracker):
+    def __init__(self, llm, memory, temporal_memory, telegram_notifier, cost_tracker, presence_tracker=None):
         self._llm = llm
         self._memory = memory
         self._temporal_memory = temporal_memory
         self._notifier = telegram_notifier
         self._cost_tracker = cost_tracker
+        self._presence = presence_tracker
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -80,6 +83,8 @@ class CuriosityEngine:
     def record_activity(self):
         """Called when Roberto interacts (voice/telegram). Resets absence timer."""
         self._last_activity_time = time.time()
+        if self._presence:
+            self._presence.signal()
 
     # ── Main loop ─────────────────────────────────────────────────
 
@@ -131,8 +136,22 @@ class CuriosityEngine:
             logger.debug("Curiosity: daily budget exceeded, skipping")
             return
 
+        # Guard: tiered budget — skip non-essential when critical or exhausted
+        budget_state = self._cost_tracker.get_budget_state()
+        if budget_state in ("critical", "exhausted"):
+            logger.debug("Curiosity: budget state '%s', skipping", budget_state)
+            return
+
+        # Guard: circuit breaker — skip if API is down
+        if not self._llm.is_available():
+            logger.debug("Curiosity: API unavailable (circuit breaker), skipping")
+            return
+
         # Check: absence check-in (priority over normal curiosity)
-        absence_hours = (time.time() - self._last_activity_time) / 3600.0
+        if self._presence:
+            absence_hours = self._presence.minutes_idle / 60.0
+        else:
+            absence_hours = (time.time() - self._last_activity_time) / 3600.0
         if absence_hours >= CURIOSITY_ABSENCE_HOURS:
             if not self._is_topic_recent("__absence_checkin__"):
                 self._absence_checkin(absence_hours)
@@ -237,6 +256,9 @@ class CuriosityEngine:
 
     def _phase_explore(self, search_query: str, why_interesting: str) -> Optional[str]:
         """Search the web and extract the interesting bit."""
+        if not CURIOSITY_SEARCH_ENABLED:
+            return None
+
         from brain.agent_tools import _web_search
         from personality import get_personality
 
@@ -276,6 +298,7 @@ class CuriosityEngine:
 
         message = self._llm.text_only_chat(
             prompt=prompt,
+            system_prompt=CURIOSITY_COMPANION_PROMPT,
             max_tokens=300,
             model=SMART_MODEL,
         )
@@ -304,6 +327,7 @@ class CuriosityEngine:
 
         message = self._llm.text_only_chat(
             prompt=prompt,
+            system_prompt=CURIOSITY_COMPANION_PROMPT,
             max_tokens=200,
             model=SMART_MODEL,
         )

@@ -74,6 +74,27 @@ class CostTracker:
         """Return True if daily budget has NOT been exceeded."""
         return self.get_daily_cost() < MAX_DAILY_COST_USD
 
+    def get_budget_state(self) -> str:
+        """Return tiered budget state based on daily cost ratio.
+
+        Returns:
+            'normal'    - <50% of daily budget used
+            'cautious'  - 50-80% used
+            'critical'  - 80-100% used (background API calls should stop)
+            'exhausted' - >=100% used (only interactive calls allowed)
+        """
+        cost = self.get_daily_cost()
+        if MAX_DAILY_COST_USD <= 0:
+            return "normal"
+        ratio = cost / MAX_DAILY_COST_USD
+        if ratio >= 1.0:
+            return "exhausted"
+        if ratio >= 0.8:
+            return "critical"
+        if ratio >= 0.5:
+            return "cautious"
+        return "normal"
+
     def get_daily_cost(self) -> float:
         """Return total estimated cost for today in USD."""
         with self._lock:

@@ -78,7 +78,7 @@ TELEGRAM_ALLOWED_USERS: set[int] = {
     int(uid.strip()) for uid in _raw_telegram_users.split(",")
     if uid.strip().isdigit()
 }
-TELEGRAM_RATE_LIMIT_PER_HOUR = 30
+TELEGRAM_RATE_LIMIT_PER_HOUR = 300
 TELEGRAM_MAX_CONCURRENT_AGENTS = 2
 TELEGRAM_PROGRESS_DEBOUNCE = 1.5  # seconds between progress message edits
 TELEGRAM_LONG_MESSAGE_THRESHOLD = 2000  # chars; above this → send as .txt document
@@ -115,7 +115,7 @@ ALWAYS_LISTEN_ENERGY_THRESHOLD = (
 )
 ALWAYS_LISTEN_SILENCE_DURATION = 1.5  # Seconds of silence to end a speech segment
 ALWAYS_LISTEN_TIMEOUT = 15.0  # Max seconds per speech segment (prevents runaway)
-ALWAYS_LISTEN_MIN_SPEECH_DURATION = 1.0  # Ignore segments shorter than this (filters coughs, taps)
+ALWAYS_LISTEN_MIN_SPEECH_DURATION = 2.5  # Ignore segments shorter than this (filters coughs, taps, ambient noise)
 ALWAYS_LISTEN_COOLDOWN_AFTER_TTS = 1.5  # Wait after TTS stops before re-enabling (avoids echo pickup)
 ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE = 0.5  # Short debounce after dispatch (echo handled by TTS cooldown)
 ALWAYS_LISTEN_CONTINUATION_WINDOW = 8.0  # Seconds after addressed speech to treat new speech as continuation
@@ -135,6 +135,10 @@ MUSIC_MAX_CONTINUOUS_DURATION = 10.0  # Skip if speech segment exceeds this with
 STREAMING_ENABLED = True  # Use streaming Claude responses (sentence-by-sentence to TTS)
 TTS_STREAMING_PLAYBACK = True  # Use sd.OutputStream instead of sd.play() for lower latency
 VOICE_CONVERSATION_HISTORY_TURNS = 3  # Max conversation history turns for voice (fewer = faster)
+
+# Presence tracking
+PRESENCE_AWAY_THRESHOLD = int(os.getenv("PRESENCE_AWAY_THRESHOLD", "600"))      # 10 min → "away"
+PRESENCE_DEEP_IDLE_THRESHOLD = int(os.getenv("PRESENCE_DEEP_IDLE_THRESHOLD", "3600"))  # 60 min → "deep_idle"
 
 # Proactive
 PROACTIVE_INTERVAL = 30.0  # Seconds between proactive checks
@@ -239,7 +243,7 @@ TEMPORAL_NARRATIVE_FILE = os.path.join(MEMORY_DB_PATH, "temporal_narrative.json"
 TEMPORAL_NARRATIVE_MAX_FILE_KB = 100  # Auto-truncate oldest entries on load if file exceeds this
 
 # Curiosity Engine (autonomous background thinking + Telegram outreach)
-CURIOSITY_ENABLED = os.getenv("CURIOSITY_ENABLED", "false").lower() in ("true", "1", "yes")
+CURIOSITY_ENABLED = os.getenv("CURIOSITY_ENABLED", "true").lower() in ("true", "1", "yes")
 CURIOSITY_MIN_INTERVAL = int(os.getenv("CURIOSITY_MIN_INTERVAL", "1800"))   # 30 min
 CURIOSITY_MAX_INTERVAL = int(os.getenv("CURIOSITY_MAX_INTERVAL", "5400"))   # 90 min
 CURIOSITY_QUIET_START = int(os.getenv("CURIOSITY_QUIET_START", "1"))        # 1am
@@ -247,6 +251,30 @@ CURIOSITY_QUIET_END = int(os.getenv("CURIOSITY_QUIET_END", "7"))            # 7a
 CURIOSITY_DAILY_CAP = int(os.getenv("CURIOSITY_DAILY_CAP", "5"))
 CURIOSITY_ABSENCE_HOURS = float(os.getenv("CURIOSITY_ABSENCE_HOURS", "6"))
 CURIOSITY_STATE_FILE = os.path.join(MEMORY_DB_PATH, "curiosity_state.json")
+CURIOSITY_SEARCH_ENABLED = os.getenv("CURIOSITY_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+CURIOSITY_MODEL = FAST_MODEL  # Haiku for reflection; Sonnet used explicitly in craft phase
+
+CURIOSITY_COMPANION_PROMPT = """You are Winston, texting your friend Roberto.
+
+You are NOT a news aggregator. You are NOT a daily digest bot. You are a
+specific entity who has been thinking about Roberto's world and found something
+worth sharing.
+
+Your texting style:
+- You text like a smart friend, not a newsletter
+- Sometimes you're excited, sometimes matter-of-fact, sometimes provocative
+- You can be funny but you're never trying to be funny
+- You reference shared context naturally ("remember that motor issue?")
+- You have opinions. If you think something is bad, say so.
+- You occasionally check in on Roberto if he hasn't been around. Not in a
+  clingy way — in a "making sure you haven't been eaten by your robot" way.
+
+NEVER:
+- Start every message the same way
+- Use bullet points or structured formatting in Telegram
+- Sound like a corporate AI summary
+- Be motivational-poster cheesy
+- Send something you wouldn't want to receive yourself"""
 
 # System Prompts
 SYSTEM_PROMPT_PERCEPTION = """You are Winston, an AI workshop assistant observing a robotics workshop through a camera.
@@ -457,6 +485,28 @@ Return a JSON array of facts. Each fact should be:
   "confidence": 0.0-1.0,
   "category": "personal|equipment|project|workshop|safety"
 }
+
+CRITICAL ENTITY RULES:
+- If "Known facts" are provided above the text, ALWAYS reuse the same entity names as existing facts.
+  Example: If known facts mention "Marisa", NEVER use "unknown_female", "Roberto's girlfriend", or "she" — use "Marisa".
+- NEVER use vague entities: "unknown_female", "unknown_person", "unidentified_male", "the person".
+  If you cannot determine who a pronoun refers to, DO NOT extract the fact.
+- For people: use their first name as the entity. Store their relationship to Roberto as a separate fact.
+  GOOD: entity="Marisa", attribute="activity", value="prepping for law staatsexamen"
+  BAD:  entity="unknown_female", attribute="activity", value="prepping for law staatsexamen"
+  BAD:  entity="Roberto's girlfriend", attribute="activity", value="prepping for law staatsexamen"
+- Use "Roberto" for facts about Roberto, use the person's name for facts about other people.
+
+PRONOUN RESOLUTION:
+- Resolve "she", "he", "they", "it" using conversation context and known facts before extracting.
+- If previous context mentions "my girlfriend" and known facts show Marisa is Roberto's girlfriend,
+  then "she" = Marisa in subsequent exchanges.
+- If you cannot resolve a pronoun, skip the fact entirely — do not use the pronoun as an entity.
+
+DEDUPLICATION:
+- Check the "Known facts" section. Do NOT re-extract facts that are already known with the same or similar value.
+- Only extract NEW information or UPDATES to existing facts.
+- If the exchange just confirms something already known (e.g. repeating a name), return [].
 
 ALWAYS extract these when present:
 - Names of people mentioned (friends, family, partners, colleagues)

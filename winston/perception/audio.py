@@ -151,6 +151,10 @@ class AudioListener:
         # Music mode state
         self._music_mode = False
 
+        # Mute state — when True, all audio processing is skipped (stream stays open)
+        self._muted = False
+        self._mute_lock = threading.Lock()
+
         # Import-time config
         from config import (
             ALWAYS_LISTEN_COOLDOWN_AFTER_RESPONSE,
@@ -395,6 +399,41 @@ class AudioListener:
     def music_mode(self) -> bool:
         return self._music_mode
 
+    # ── Mute control ─────────────────────────────────────────────────
+
+    def mute(self) -> None:
+        """Mute microphone input processing. Audio stream stays open."""
+        with self._mute_lock:
+            if self._muted:
+                return
+            self._muted = True
+        logger.info("Microphone muted")
+        if self._al_state == "accumulating":
+            self._al_cancel("muted")
+
+    def unmute(self) -> None:
+        """Unmute microphone input processing."""
+        with self._mute_lock:
+            if not self._muted:
+                return
+            self._muted = False
+        logger.info("Microphone unmuted")
+
+    def toggle_mute(self) -> bool:
+        """Toggle mute state. Returns new state (True = muted)."""
+        with self._mute_lock:
+            self._muted = not self._muted
+            new_state = self._muted
+        logger.info("Microphone %s", "muted" if new_state else "unmuted")
+        if new_state and self._al_state == "accumulating":
+            self._al_cancel("muted")
+        return new_state
+
+    @property
+    def is_muted(self) -> bool:
+        """Whether microphone input processing is currently muted."""
+        return self._muted
+
     def measure_ambient_noise(self, duration: float = 3.0) -> float:
         """Measure ambient noise level for threshold calibration."""
         import time
@@ -470,6 +509,10 @@ class AudioListener:
                 oww_buffer = oww_buffer[CHUNK_SAMPLES:]
 
                 self._debug_frame_counter += 1
+
+                # Mute guard: skip all frame processing (barge-in, always-listen, wake-word)
+                if self._muted:
+                    continue
 
                 # Barge-in detection during TTS playback.
                 # Gate on _tts_active (set by on_tts_start callback, same time
@@ -709,6 +752,9 @@ class AudioListener:
 
         Called from _processing_loop. MUST NOT block.
         """
+        if self._muted:
+            return
+
         if not self._always_listen_enabled or self._al_state == "disabled":
             return
 

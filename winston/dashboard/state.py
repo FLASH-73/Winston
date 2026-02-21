@@ -29,6 +29,7 @@ class WinstonState:
         self.budget_max = 2.0
         self.always_listen_state = "disabled"
         self.music_mode = False
+        self.muted = False
 
         # Content
         self.conversation = []  # [{"role": str, "text": str, "timestamp": str}]
@@ -96,6 +97,13 @@ class WinstonState:
         with self._lock:
             if self.music_mode != enabled:
                 self.music_mode = enabled
+                self._version += 1
+
+    def set_muted(self, muted: bool):
+        """Update microphone mute status."""
+        with self._lock:
+            if self.muted != muted:
+                self.muted = muted
                 self._version += 1
 
     def set_latency_stats(self, stats: dict):
@@ -222,6 +230,7 @@ class WinstonState:
                 "uptime": round(time.time() - self._start_time, 1),
                 "alwaysListenState": self.always_listen_state,
                 "musicMode": self.music_mode,
+                "muted": self.muted,
                 "agentTasks": list(self.agent_tasks),
                 "notes": list(self.notes),
                 "latencyStats": dict(self.latency_stats),

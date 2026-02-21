@@ -61,10 +61,50 @@ from config import (
     CAMERA_ANALYSIS_INTERVAL,
     CAPTURE_INTERVAL,
     MAX_DAILY_COST_USD,
+    PRESENCE_AWAY_THRESHOLD,
+    PRESENCE_DEEP_IDLE_THRESHOLD,
     STREAMING_ENABLED,
     SYSTEM_PROMPT_PERCEPTION,
 )
 from dashboard.state import WinstonState  # stdlib only, instant
+
+
+class PresenceTracker:
+    """Track Roberto's presence via multiple signals.
+
+    States: present / away (>10 min) / deep_idle (>60 min).
+    Call signal() from any interaction channel (voice, telegram, scene change).
+    """
+
+    def __init__(self):
+        self._last_presence = time.time()
+        self._state = "present"
+
+    def signal(self):
+        """Called when any presence signal fires."""
+        was = self._state
+        self._last_presence = time.time()
+        self._state = "present"
+        if was != "present":
+            logger.info("Presence: Roberto is back (%s → present)", was)
+
+    def get_state(self) -> str:
+        """Get current presence state."""
+        elapsed = time.time() - self._last_presence
+        if elapsed > PRESENCE_DEEP_IDLE_THRESHOLD:
+            new = "deep_idle"
+        elif elapsed > PRESENCE_AWAY_THRESHOLD:
+            new = "away"
+        else:
+            new = "present"
+        if new != self._state:
+            logger.info("Presence: %s → %s (%.0f min idle)", self._state, new, elapsed / 60)
+            self._state = new
+        return self._state
+
+    @property
+    def minutes_idle(self) -> float:
+        return (time.time() - self._last_presence) / 60
 
 
 class Winston:
@@ -106,6 +146,10 @@ class Winston:
         # Session timing for personality mood tracking
         self._session_start: float = time.time()
         self._last_mood_update: float = 0.0
+        # Presence-aware duty cycling
+        self._presence = PresenceTracker()
+        self._last_presence_state: str = "present"
+        self._last_status_log: float = 0.0
         # All other modules created lazily in start()
 
     def start(self) -> bool:
@@ -292,6 +336,7 @@ class Winston:
         self.proactive = ProactiveEngine(
             self.camera, self.llm, self.memory, self.tts,
             temporal_memory=self._temporal_memory,
+            cost_tracker=self.cost_tracker,
         )
 
         # ── 4b. Visual Cortex (Gemini background observer) ──────────────
@@ -374,6 +419,8 @@ class Winston:
                     stt_provider=stt_provider,
                     tts_engine=self.tts,
                     clip_recorder=self._clip_recorder,
+                    presence_tracker=self._presence,
+                    audio=self.audio,
                 )
                 threading.Thread(
                     target=self._telegram_bot.start,
@@ -403,6 +450,7 @@ class Winston:
                         temporal_memory=self._temporal_memory,
                         telegram_notifier=self._telegram_notifier,
                         cost_tracker=self.cost_tracker,
+                        presence_tracker=self._presence,
                     )
                     self._curiosity_engine.start()
                     logger.info("Curiosity engine enabled")
@@ -413,6 +461,17 @@ class Winston:
                 set_telegram_bot(self._telegram_bot)
             else:
                 logger.warning("TELEGRAM_ENABLED=true but TELEGRAM_BOT_TOKEN not set")
+
+        # Wire circuit breaker → Telegram alert (if available)
+        def _on_circuit_open(error_desc: str):
+            logger.warning("API circuit breaker OPEN: %s", error_desc[:200])
+            if self._telegram_notifier:
+                self._telegram_notifier.notify(
+                    f"API credits depleted. Background tasks paused. "
+                    f"Will probe again in a few minutes.\n\nError: {error_desc[:300]}"
+                )
+
+        self.llm.set_circuit_breaker_callback(_on_circuit_open)
 
         return True
 
@@ -452,12 +511,23 @@ class Winston:
                 # 1. Capture frame
                 frame_bytes = self.camera.get_frame_bytes()
 
+                # Presence-aware duty cycling
+                presence = self._presence.get_state()
+                if presence != self._last_presence_state:
+                    self._last_presence_state = presence
+                    if self._visual_cortex and self._visual_cortex.is_alive():
+                        multiplier = {"present": 1, "away": 3, "deep_idle": 10}[presence]
+                        self._visual_cortex.set_batch_interval_multiplier(multiplier)
+
                 # 2. Scene change detection -> Flash analysis (throttled)
                 #    Skipped when Gemini visual cortex is running (it handles vision)
                 if not (self._visual_cortex and self._visual_cortex.is_alive()):
                     conversation_active = self.tts.is_speaking or self.audio.pipeline_state == "recording"
-                    analysis_due = (time.monotonic() - self._last_camera_analysis_time) >= CAMERA_ANALYSIS_INTERVAL
+                    _presence_mul = {"present": 1, "away": 3, "deep_idle": 10}[presence]
+                    effective_analysis_interval = CAMERA_ANALYSIS_INTERVAL * _presence_mul
+                    analysis_due = (time.monotonic() - self._last_camera_analysis_time) >= effective_analysis_interval
                     if frame_bytes and analysis_due and not conversation_active and self.camera.scene_changed():
+                        self._presence.signal()
                         self._last_camera_analysis_time = time.monotonic()
                         result = self.llm.analyze_frame(
                             frame_bytes,
@@ -490,8 +560,8 @@ class Winston:
                             logger.warning("Camera analysis suspended: >50%% daily budget used")
                             self._last_camera_analysis_time = time.monotonic() + 300  # Skip 5 min
 
-                # 3. Proactive check
-                if frame_bytes and self.proactive.should_check():
+                # 3. Proactive check — only when Roberto is present
+                if presence == "present" and frame_bytes and self.proactive.should_check():
                     temporal_narrative = ""
                     if self._temporal_memory:
                         temporal_narrative = self._temporal_memory.get_narrative(hours=2.0)
@@ -539,7 +609,18 @@ class Winston:
 
                     update_mood(session_min, narrative)
 
-                # 6. Update latency stats for dashboard
+                # 6. Periodic presence status log (every 5 min)
+                if time.monotonic() - self._last_status_log >= 300:
+                    self._last_status_log = time.monotonic()
+                    logger.info(
+                        "Status: presence=%s (%.0f min idle), daily_cost=$%.2f, muted=%s",
+                        presence,
+                        self._presence.minutes_idle,
+                        self.cost_tracker.get_daily_cost(),
+                        self.audio.is_muted,
+                    )
+
+                # 7. Update latency stats for dashboard
                 from utils.latency_tracker import LatencyTracker
 
                 lat_tracker = LatencyTracker.get()
@@ -667,6 +748,7 @@ class Winston:
             # Reset curiosity engine absence timer on voice interaction
             if self._curiosity_engine:
                 self._curiosity_engine.record_activity()
+            self._presence.signal()
 
             if not text.strip():
                 logger.info("[transcription] Empty text, ignoring")
@@ -695,6 +777,31 @@ class Winston:
                 self.audio.set_music_mode(False)
                 self.state.set_music_mode(False)
                 msg = "Music mode off. Listening normally." if lang != "de" else "Musikmodus aus. Ich höre normal."
+                self.tts.speak_async(msg)
+                self.state.set_status("idle")
+                tracker.discard(interaction_id)
+                return
+
+            # Quick local check for mute toggle (no API call needed)
+            if any(phrase in text_lower for phrase in [
+                "mute", "go quiet", "shut up", "stop listening", "be quiet",
+                "halt mal die klappe", "sei still", "sei ruhig",
+            ]):
+                self.audio.mute()
+                self.state.set_muted(True)
+                msg = "Muted." if lang != "de" else "Stummgeschaltet."
+                self.tts.speak_async(msg)
+                self.state.set_status("idle")
+                tracker.discard(interaction_id)
+                return
+
+            if any(phrase in text_lower for phrase in [
+                "unmute", "start listening", "i'm back", "listen up",
+                "hör zu", "ich bin zurück",
+            ]):
+                self.audio.unmute()
+                self.state.set_muted(False)
+                msg = "I'm listening." if lang != "de" else "Ich höre zu."
                 self.tts.speak_async(msg)
                 self.state.set_status("idle")
                 tracker.discard(interaction_id)
@@ -911,16 +1018,25 @@ class Winston:
 
                 # Extract facts from genuine conversations (skip error fallbacks)
                 if not response.startswith("Sorry"):
-                    # Grab previous exchange for context (helps infer relationships)
+                    # Grab up to 3 previous exchanges for context (helps resolve pronouns)
                     prev_context = ""
                     convs = self.memory.working.conversations
-                    if len(convs) >= 2:
-                        prev = convs[-2]
-                        prev_context = f"Q: {prev['question']}\nA: {prev['answer']}"
+                    prev_exchanges = []
+                    for i in range(min(3, len(convs) - 1)):
+                        prev = convs[-(i + 2)]
+                        prev_exchanges.append(f"Q: {prev['question']}\nA: {prev['answer']}")
+                    if prev_exchanges:
+                        prev_exchanges.reverse()
+                        prev_context = "\n".join(prev_exchanges)
 
-                    def _safe_extract_facts(memory, text, llm, ctx):
+                    # Inject relevant existing facts so the extractor knows canonical entity names
+                    existing_facts = self.memory.semantic.get_related_facts(conversation_text)
+
+                    def _safe_extract_facts(memory, text, llm, ctx, facts):
                         try:
-                            count = memory.extract_facts_from_text(text, llm, recent_context=ctx)
+                            count = memory.extract_facts_from_text(
+                                text, llm, recent_context=ctx, existing_facts=facts,
+                            )
                             if count > 0:
                                 logger.info("[facts] Extracted %d new facts", count)
                         except Exception as e:
@@ -928,7 +1044,7 @@ class Winston:
 
                     threading.Thread(
                         target=_safe_extract_facts,
-                        args=(self.memory, conversation_text, self.llm, prev_context),
+                        args=(self.memory, conversation_text, self.llm, prev_context, existing_facts),
                         daemon=True,
                         name="fact-extraction",
                     ).start()

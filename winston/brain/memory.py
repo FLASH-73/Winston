@@ -62,6 +62,19 @@ _TEMPORAL_QUERY_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+_VAGUE_ENTITY_PATTERNS = re.compile(
+    r"^(unknown_?\w*|unidentified_?\w*|unnamed_?\w*"
+    r"|he|she|they|it|him|her|them"
+    r"|the person|someone|a friend|a person|some guy|some girl"
+    r"|a man|a woman|the man|the woman)$",
+    re.IGNORECASE,
+)
+
+# Fact attributes that define entity aliases/relationships
+_RELATIONSHIP_ATTRS = frozenset({
+    "relationship", "relation", "role", "alias", "also_known_as", "name",
+})
+
 
 # ---------------------------------------------------------------------------
 # Tier 1: Working Memory (in-process, ephemeral)
@@ -303,6 +316,9 @@ class EpisodicMemory:
         """Generate and store a session summary using Claude Haiku."""
         if not session_text.strip():
             return None
+        if hasattr(llm_client, "is_available") and not llm_client.is_available():
+            logger.warning("[memory] Skipping session summary: API circuit breaker open")
+            return None
 
         try:
             summary = llm_client.text_only_chat(
@@ -464,6 +480,8 @@ class SemanticMemory:
         self._chromadb_collection: Optional[chromadb.Collection] = None
         self._facts_text_cache: str = ""
         self._facts_cache_valid: bool = False
+        self._alias_map: dict[str, str] = {}
+        self._alias_map_valid: bool = False
 
     def initialize(self, client: chromadb.ClientAPI, db_path: str) -> None:
         self._profile_path = os.path.join(db_path, MEMORY_USER_PROFILE_FILE)
@@ -488,6 +506,7 @@ class SemanticMemory:
     def _save_profile(self) -> None:
         """Atomically save facts to JSON file."""
         self._facts_cache_valid = False  # Invalidate formatted text cache
+        self._alias_map_valid = False  # Invalidate entity alias cache
         data = {"facts": self._facts, "updated": datetime.now().isoformat()}
         dir_path = os.path.dirname(self._profile_path)
         os.makedirs(dir_path, exist_ok=True)
@@ -543,6 +562,15 @@ class SemanticMemory:
             value = f.get("value", "")
             if not entity or not attribute or not value:
                 continue
+
+            # Resolve entity to canonical name (e.g. "Roberto's girlfriend" → "Marisa")
+            entity = self._resolve_entity(entity)
+
+            # Skip unresolvable vague entities (unknown_*, pronouns, etc.)
+            if self._is_vague_entity(entity):
+                logger.debug("[facts] Skipping vague entity: %s", entity)
+                continue
+
             self.add_fact(
                 entity=entity,
                 attribute=attribute,
@@ -597,6 +625,139 @@ class SemanticMemory:
         except Exception as e:
             logger.error("Semantic fact search failed: %s", e)
             return []
+
+    def get_related_facts(self, text: str, n: int = 8) -> str:
+        """Return existing facts relevant to the given text, formatted for the extraction prompt."""
+        facts = self.search_facts(text, n_results=n)
+        if not facts:
+            return ""
+        return "Known facts (use these entity names):\n" + "\n".join(f"- {f}" for f in facts)
+
+    # -- Entity resolution -------------------------------------------------
+
+    def _build_alias_map(self) -> dict[str, str]:
+        """Build a lowercase mapping from aliases → canonical entity name.
+
+        Uses relationship-type facts to create reverse lookups. E.g. if
+        ``Marisa.relationship = "Roberto's girlfriend"`` exists, then
+        ``"roberto's girlfriend" → "Marisa"``.
+        """
+        alias_map: dict[str, str] = {}
+        for fact in self._facts:
+            attr = fact.get("attribute", "").lower()
+            if attr in _RELATIONSHIP_ATTRS:
+                alias = fact["value"].lower().strip()
+                canonical = fact["entity"]
+                if alias and canonical:
+                    alias_map[alias] = canonical
+        return alias_map
+
+    def _resolve_entity(self, entity: str) -> str:
+        """Resolve an entity name to its canonical form using known facts.
+
+        Examples:
+            "Roberto's girlfriend" → "Marisa"  (via alias map)
+            "unknown_female" → kept as-is (handled by _is_vague_entity later)
+            "John" (unknown) → "John" (no change)
+        """
+        if not self._alias_map_valid:
+            self._alias_map = self._build_alias_map()
+            self._alias_map_valid = True
+
+        key = entity.lower().strip()
+
+        # Direct alias match
+        if key in self._alias_map:
+            resolved = self._alias_map[key]
+            logger.debug("[facts] Resolved entity '%s' → '%s'", entity, resolved)
+            return resolved
+
+        # Possessive/descriptor match — only for multi-word keys to avoid
+        # false positives (e.g. "roberto" matching "roberto's girlfriend")
+        if " " in key or "'s" in key:
+            for alias, canonical in self._alias_map.items():
+                if key in alias or alias in key:
+                    logger.debug("[facts] Fuzzy-resolved entity '%s' → '%s'", entity, canonical)
+                    return canonical
+
+        return entity
+
+    @staticmethod
+    def _is_vague_entity(entity: str) -> bool:
+        """Return True if the entity is too vague to store (pronouns, unknown_*, etc.)."""
+        return bool(_VAGUE_ENTITY_PATTERNS.match(entity.strip()))
+
+    # -- Consolidation -----------------------------------------------------
+
+    def _delete_chromadb_fact(self, fact: dict) -> None:
+        """Remove a fact from ChromaDB by its computed ID."""
+        if not self._chromadb_collection:
+            return
+        try:
+            self._chromadb_collection.delete(ids=[self._fact_id(fact)])
+        except Exception as e:
+            logger.debug("Failed to delete fact from ChromaDB: %s", e)
+
+    def consolidate_entities(self) -> int:
+        """Merge facts stored under different names for the same entity.
+
+        Uses relationship facts to build an alias graph, then merges all facts
+        to the canonical (proper-noun) entity name.  Returns number of facts merged.
+        """
+        alias_map = self._build_alias_map()
+        if not alias_map:
+            return 0
+
+        merged = 0
+        facts_to_remove: list[int] = []
+
+        for i, fact in enumerate(self._facts):
+            entity_lower = fact["entity"].lower().strip()
+            if entity_lower not in alias_map:
+                continue
+            canonical = alias_map[entity_lower]
+            if fact["entity"] == canonical:
+                continue  # already canonical
+
+            attr_lower = fact["attribute"].lower()
+            existing = next(
+                (f for f in self._facts
+                 if f["entity"] == canonical and f["attribute"].lower() == attr_lower),
+                None,
+            )
+            if existing:
+                # Keep higher confidence or more recent
+                if fact.get("confidence", 0) > existing.get("confidence", 0):
+                    existing["value"] = fact["value"]
+                    existing["confidence"] = fact["confidence"]
+                    existing["last_confirmed"] = fact.get("last_confirmed", existing.get("last_confirmed"))
+                    self._update_chromadb_fact(existing)
+                self._delete_chromadb_fact(fact)
+                facts_to_remove.append(i)
+            else:
+                # Move fact to canonical entity
+                self._delete_chromadb_fact(fact)
+                fact["entity"] = canonical
+                self._add_chromadb_fact(fact)
+
+            merged += 1
+
+        # Also remove vague entities that couldn't be resolved
+        for i, fact in enumerate(self._facts):
+            if i not in facts_to_remove and self._is_vague_entity(fact["entity"]):
+                self._delete_chromadb_fact(fact)
+                facts_to_remove.append(i)
+                merged += 1
+
+        # Remove merged/vague facts (reverse order to preserve indices)
+        for i in sorted(facts_to_remove, reverse=True):
+            self._facts.pop(i)
+
+        if merged > 0:
+            self._save_profile()
+            logger.info("[facts] Consolidated %d fragmented facts", merged)
+
+        return merged
 
     @property
     def fact_count(self) -> int:
@@ -657,6 +818,12 @@ class Memory:
             self._client = chromadb.PersistentClient(path=MEMORY_DB_PATH)
             self.episodic.initialize(self._client)
             self.semantic.initialize(self._client, MEMORY_DB_PATH)
+
+            # Clean up entity fragmentation from previous sessions
+            consolidated = self.semantic.consolidate_entities()
+            if consolidated:
+                logger.info("[memory] Consolidated %d fragmented entity facts on startup", consolidated)
+
             logger.info(
                 "Memory system online — %d episodes, %d facts", self.episodic.episode_count, self.semantic.fact_count
             )
@@ -750,6 +917,14 @@ class Memory:
             sections.append(facts_text)
             tokens_used += self._estimate_tokens(facts_text)
 
+        # Promote query-relevant facts to a highlighted section (helps pronoun resolution)
+        if purpose == "conversation" and query:
+            relevant = self.semantic.search_facts(query, n_results=5)
+            if relevant:
+                focused = "\n".join(f"- {r}" for r in relevant)
+                sections.append(f"\n## Relevant to this query:\n{focused}")
+                tokens_used += self._estimate_tokens(focused)
+
         # Lightweight: facts only, skip everything else (no DB calls)
         if purpose == "lightweight":
             return "\n".join(sections) if sections else ""
@@ -802,19 +977,31 @@ class Memory:
 
         return "\n".join(sections)
 
-    def extract_facts_from_text(self, text: str, llm_client, recent_context: str = "") -> int:
+    def extract_facts_from_text(
+        self, text: str, llm_client, recent_context: str = "", existing_facts: str = ""
+    ) -> int:
         """Use Claude Haiku to extract structured facts from text.
 
         Args:
             text: Current Q/A exchange to analyze.
             llm_client: LLM client for API calls.
             recent_context: Optional previous exchange(s) for relationship inference.
+            existing_facts: Pre-formatted relevant facts so the LLM knows canonical entity names.
 
         Returns the number of facts extracted.
         """
+        if hasattr(llm_client, "is_available") and not llm_client.is_available():
+            logger.debug("[facts] Skipping extraction: API circuit breaker open")
+            return 0
         try:
             logger.info("[facts] Attempting extraction from: %s", text[:100])
-            analysis = f"Previous context:\n{recent_context}\n\n{text}" if recent_context else text
+            parts: list[str] = []
+            if existing_facts:
+                parts.append(existing_facts)
+            if recent_context:
+                parts.append(f"Previous conversation:\n{recent_context}")
+            parts.append(text)
+            analysis = "\n\n".join(parts)
             response = llm_client.text_only_chat(
                 prompt=f"Text to analyze:\n{analysis}",
                 system_prompt=SYSTEM_PROMPT_FACT_EXTRACTION,
@@ -854,6 +1041,9 @@ class Memory:
 
         # Extract any remaining facts from the full session
         self.extract_facts_from_text(session_text, llm_client)
+
+        # Merge any fragmented entities created during this session
+        self.semantic.consolidate_entities()
 
         logger.info(
             "Session shutdown complete — %d episodes, %d facts total",

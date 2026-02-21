@@ -18,12 +18,13 @@ logger = logging.getLogger("winston.proactive")
 
 
 class ProactiveEngine:
-    def __init__(self, camera, llm, memory, tts, temporal_memory=None):
+    def __init__(self, camera, llm, memory, tts, temporal_memory=None, cost_tracker=None):
         self._camera = camera
         self._llm = llm
         self._memory = memory
         self._tts = tts
         self._temporal_memory = temporal_memory
+        self._cost_tracker = cost_tracker
 
         self._proactive_interval = PROACTIVE_INTERVAL
         self._last_check_time = 0.0
@@ -45,6 +46,16 @@ class ProactiveEngine:
         Returns the spoken message if Winston decided to speak, None otherwise.
         """
         self._last_check_time = time.time()
+
+        # Guard: circuit breaker
+        if not self._llm.is_available():
+            return None
+
+        # Guard: tiered budget
+        if self._cost_tracker:
+            budget_state = self._cost_tracker.get_budget_state()
+            if budget_state in ("critical", "exhausted"):
+                return None
 
         # If temporal memory has narrative, prefer text-based analysis
         # (visual cortex already handles vision via Gemini)

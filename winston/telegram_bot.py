@@ -170,6 +170,8 @@ class TelegramBot:
         stt_provider=None,
         tts_engine=None,
         clip_recorder=None,
+        presence_tracker=None,
+        audio=None,
     ):
         self._token = token
         self._allowed_users = allowed_users
@@ -184,6 +186,8 @@ class TelegramBot:
         self._stt_provider = stt_provider
         self._tts_engine = tts_engine
         self._clip_recorder = clip_recorder
+        self._presence = presence_tracker
+        self._audio = audio
 
         from config import (
             TELEGRAM_AGENT_RATE_LIMIT_PER_HOUR,
@@ -277,6 +281,10 @@ class TelegramBot:
         app.add_handler(CommandHandler("watch", self._cmd_watch))
         app.add_handler(CommandHandler("stop", self._cmd_stop))
 
+        # Audio control commands
+        app.add_handler(CommandHandler("mute", self._cmd_mute))
+        app.add_handler(CommandHandler("unmute", self._cmd_unmute))
+
         # Session & security commands
         app.add_handler(CommandHandler("clear", self._cmd_clear))
         app.add_handler(CommandHandler("block", self._cmd_block))
@@ -289,6 +297,12 @@ class TelegramBot:
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         app.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self._handle_voice))
+        app.add_handler(MessageHandler(filters.VIDEO, self._handle_video))
+        app.add_handler(MessageHandler(filters.VIDEO_NOTE, self._handle_video_note))
+        app.add_handler(MessageHandler(filters.ANIMATION, self._handle_animation))
+        app.add_handler(MessageHandler(
+            filters.Document.IMAGE | filters.Document.VIDEO, self._handle_document_media
+        ))
 
         # Edited message handler
         app.add_handler(MessageHandler(
@@ -384,6 +398,8 @@ class TelegramBot:
             if msg:
                 await msg.reply_text("Sorry, I'm not authorized to chat with you.")
             return False
+        if self._presence:
+            self._presence.signal()
         return True
 
     async def _check_rate_limit(self, update: Update) -> bool:
@@ -466,6 +482,8 @@ class TelegramBot:
                 "/camera or /cam \u2014 Capture workshop snapshot\n"
                 "/watch \u2014 Monitor workshop (30s intervals, 5min)\n"
                 "/stop \u2014 Stop watching\n"
+                "/mute \u2014 Mute microphone (stop listening)\n"
+                "/unmute \u2014 Unmute microphone\n"
                 "/clear \u2014 Clear conversation history\n"
                 "/status \u2014 System status\n"
                 "/cost \u2014 Today's API cost breakdown\n"
@@ -541,11 +559,13 @@ class TelegramBot:
             running = sum(1 for t in tasks if t.get("status") == "running")
             completed = sum(1 for t in tasks if t.get("status") == "completed")
             failed = sum(1 for t in tasks if t.get("status") == "failed")
+            muted = self._audio.is_muted if self._audio else False
 
             await update.message.reply_text(
                 f"Winston Status\n"
                 f"{'=' * 20}\n"
                 f"Uptime: {hours}h {minutes}m {seconds}s\n"
+                f"Mic: {'MUTED' if muted else 'listening'}\n"
                 f"Memory: {episodes} episodes, {facts} facts\n"
                 f"Cost today: ${daily_cost:.4f}\n"
                 f"Agent tasks: {running} running, {completed} done, {failed} failed"
@@ -870,6 +890,38 @@ class TelegramBot:
             logger.error("Telegram /stop error: %s", e, exc_info=True)
             await self._send_error(update)
 
+    # ── Audio Control Commands ────────────────────────────────
+
+    async def _cmd_mute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            if not await self._check_user(update):
+                return
+            self._audit("command", update.effective_user.id, "/mute")
+            if not self._audio:
+                await update.message.reply_text("Audio subsystem not available.")
+                return
+            self._audio.mute()
+            self._state.set_muted(True)
+            await update.message.reply_text("Microphone muted. Use /unmute to re-enable.")
+        except Exception as e:
+            logger.error("Telegram /mute error: %s", e, exc_info=True)
+            await self._send_error(update)
+
+    async def _cmd_unmute(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            if not await self._check_user(update):
+                return
+            self._audit("command", update.effective_user.id, "/unmute")
+            if not self._audio:
+                await update.message.reply_text("Audio subsystem not available.")
+                return
+            self._audio.unmute()
+            self._state.set_muted(False)
+            await update.message.reply_text("Microphone unmuted. Listening normally.")
+        except Exception as e:
+            logger.error("Telegram /unmute error: %s", e, exc_info=True)
+            await self._send_error(update)
+
     # ── Session Commands ─────────────────────────────────────
 
     async def _cmd_clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1080,6 +1132,179 @@ class TelegramBot:
             logger.error("Telegram voice handler error: %s", e, exc_info=True)
             await self._send_error(update)
 
+    # ── Media Handlers (video, GIF, documents) ──────────────
+
+    async def _handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming video messages — extract frames and analyse."""
+        try:
+            if not await self._check_user(update):
+                return
+            if not await self._check_rate_limit(update):
+                return
+
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            self._audit("video_message", user_id)
+
+            video = update.message.video
+            file = await context.bot.get_file(video.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+
+            frames = await asyncio.to_thread(
+                self._extract_video_frames, buf.getvalue(), 4
+            )
+            if frames is None:
+                await update.message.reply_text(
+                    "Could not process video. Is ffmpeg installed?"
+                )
+                return
+
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+            caption = update.message.caption or "What's happening in this video?"
+            duration = video.duration or 0
+            caption += f"\n[Video: {duration}s, {len(frames)} frames extracted]"
+            lang = self._detect_language(caption)
+
+            await self._process_message(
+                caption, user_id, chat_id, lang, update, frame_bytes=frames
+            )
+        except Exception as e:
+            logger.error("Telegram video handler error: %s", e, exc_info=True)
+            await self._send_error(update)
+
+    async def _handle_video_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming video notes (round selfie bubbles) — extract frames."""
+        try:
+            if not await self._check_user(update):
+                return
+            if not await self._check_rate_limit(update):
+                return
+
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            self._audit("video_note_message", user_id)
+
+            vnote = update.message.video_note
+            file = await context.bot.get_file(vnote.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+
+            frames = await asyncio.to_thread(
+                self._extract_video_frames, buf.getvalue(), 3
+            )
+            if frames is None:
+                await update.message.reply_text(
+                    "Could not process video note. Is ffmpeg installed?"
+                )
+                return
+
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+            caption = "What do you see in this video note?"
+            lang = "en"
+
+            await self._process_message(
+                caption, user_id, chat_id, lang, update, frame_bytes=frames
+            )
+        except Exception as e:
+            logger.error("Telegram video note handler error: %s", e, exc_info=True)
+            await self._send_error(update)
+
+    async def _handle_animation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming GIF/animation messages — extract frames."""
+        try:
+            if not await self._check_user(update):
+                return
+            if not await self._check_rate_limit(update):
+                return
+
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            self._audit("animation_message", user_id)
+
+            anim = update.message.animation
+            file = await context.bot.get_file(anim.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+
+            frames = await asyncio.to_thread(
+                self._extract_video_frames, buf.getvalue(), 3
+            )
+            if frames is None:
+                await update.message.reply_text(
+                    "Could not process GIF. Is ffmpeg installed?"
+                )
+                return
+
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+            caption = update.message.caption or "What's in this GIF?"
+            lang = self._detect_language(caption)
+
+            await self._process_message(
+                caption, user_id, chat_id, lang, update, frame_bytes=frames
+            )
+        except Exception as e:
+            logger.error("Telegram animation handler error: %s", e, exc_info=True)
+            await self._send_error(update)
+
+    async def _handle_document_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle images and videos sent as document attachments."""
+        try:
+            if not await self._check_user(update):
+                return
+            if not await self._check_rate_limit(update):
+                return
+
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            self._audit("document_media_message", user_id)
+
+            doc = update.message.document
+            mime = doc.mime_type or ""
+
+            file = await context.bot.get_file(doc.file_id)
+            buf = BytesIO()
+            await file.download_to_memory(buf)
+            file_bytes = buf.getvalue()
+
+            if mime.startswith("image/"):
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                caption = update.message.caption or "What do you see in this image?"
+                lang = self._detect_language(caption)
+                await self._process_message(
+                    caption, user_id, chat_id, lang, update, frame_bytes=file_bytes
+                )
+
+            elif mime.startswith("video/"):
+                frames = await asyncio.to_thread(
+                    self._extract_video_frames, file_bytes, 4
+                )
+                if frames is None:
+                    await update.message.reply_text(
+                        "Could not process video document. Is ffmpeg installed?"
+                    )
+                    return
+
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                caption = update.message.caption or "What's happening in this video?"
+                filename = doc.file_name or "video"
+                caption += f"\n[File: {filename}, {len(frames)} frames extracted]"
+                lang = self._detect_language(caption)
+                await self._process_message(
+                    caption, user_id, chat_id, lang, update, frame_bytes=frames
+                )
+
+            else:
+                await update.message.reply_text(
+                    f"Unsupported document type: {mime or 'unknown'}"
+                )
+        except Exception as e:
+            logger.error("Telegram document media handler error: %s", e, exc_info=True)
+            await self._send_error(update)
+
     async def _handle_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Log edited messages. Full edit-swap would require per-message state tracking."""
         if update.edited_message and update.edited_message.text:
@@ -1215,24 +1440,33 @@ class TelegramBot:
 
         # Extract facts (same pattern as voice path in main.py)
         if not response.startswith("Sorry"):
-            # Grab previous exchange for context (helps infer relationships)
+            # Grab up to 3 previous exchanges for context (helps resolve pronouns)
             prev_context = ""
             convs = self._memory.working.conversations
-            if len(convs) >= 2:
-                prev = convs[-2]
-                prev_context = f"Q: {prev['question']}\nA: {prev['answer']}"
+            prev_exchanges = []
+            for i in range(min(3, len(convs) - 1)):
+                prev = convs[-(i + 2)]
+                prev_exchanges.append(f"Q: {prev['question']}\nA: {prev['answer']}")
+            if prev_exchanges:
+                prev_exchanges.reverse()
+                prev_context = "\n".join(prev_exchanges)
+
+            # Inject relevant existing facts so the extractor knows canonical entity names
+            existing_facts = self._memory.semantic.get_related_facts(conversation_text)
 
             threading.Thread(
                 target=self._safe_extract_facts,
-                args=(conversation_text, prev_context),
+                args=(conversation_text, prev_context, existing_facts),
                 daemon=True,
                 name="fact-extraction",
             ).start()
 
-    def _safe_extract_facts(self, text: str, recent_context: str = "") -> None:
+    def _safe_extract_facts(self, text: str, recent_context: str = "", existing_facts: str = "") -> None:
         """Extract semantic facts from conversation text with error logging."""
         try:
-            count = self._memory.extract_facts_from_text(text, self._llm, recent_context=recent_context)
+            count = self._memory.extract_facts_from_text(
+                text, self._llm, recent_context=recent_context, existing_facts=existing_facts,
+            )
             if count > 0:
                 logger.info("[facts] Extracted %d new facts from Telegram", count)
         except Exception as e:
@@ -1362,6 +1596,87 @@ class TelegramBot:
         except subprocess.TimeoutExpired:
             logger.error("[telegram] ffmpeg conversion timed out")
             return None
+
+    @staticmethod
+    def _extract_video_frames(
+        video_bytes: bytes, max_frames: int = 4, timeout: int = 30
+    ) -> Optional[list[tuple[str, bytes]]]:
+        """Extract evenly-spaced JPEG frames from video bytes via ffmpeg.
+
+        Returns a list of (label, jpeg_bytes) tuples suitable for passing
+        as frame_bytes to _process_message, or None on failure.
+        """
+        import tempfile
+
+        tmp_path = None
+        try:
+            # Write to temp file — ffmpeg seeking is more reliable with files
+            fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            with open(tmp_path, "wb") as f:
+                f.write(video_bytes)
+
+            # Get duration via ffprobe
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", tmp_path,
+                ],
+                capture_output=True,
+                timeout=timeout,
+            )
+            if probe.returncode != 0 or not probe.stdout.strip():
+                logger.error("[telegram] ffprobe failed: %s", probe.stderr[:200])
+                return None
+
+            duration = float(probe.stdout.strip())
+            if duration <= 0:
+                logger.error("[telegram] video has zero or negative duration")
+                return None
+
+            # Calculate evenly-spaced timestamps, skipping first/last 5%
+            start = duration * 0.05
+            end = duration * 0.95
+            if max_frames == 1:
+                timestamps = [duration / 2]
+            else:
+                step = (end - start) / (max_frames - 1)
+                timestamps = [start + i * step for i in range(max_frames)]
+
+            frames: list[tuple[str, bytes]] = []
+            for ts in timestamps:
+                proc = subprocess.run(
+                    [
+                        "ffmpeg", "-ss", f"{ts:.3f}",
+                        "-i", tmp_path,
+                        "-frames:v", "1", "-q:v", "2",
+                        "-f", "image2", "pipe:1",
+                    ],
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    label = f"[Frame at {ts:.1f}s / {duration:.1f}s]"
+                    frames.append((label, proc.stdout))
+
+            if not frames:
+                logger.error("[telegram] no frames extracted from video")
+                return None
+            return frames
+
+        except FileNotFoundError:
+            logger.error("[telegram] ffmpeg/ffprobe not found — install for video support")
+            return None
+        except subprocess.TimeoutExpired:
+            logger.error("[telegram] video frame extraction timed out")
+            return None
+        except (ValueError, OSError) as e:
+            logger.error("[telegram] video frame extraction failed: %s", e)
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     async def _send_voice_response(self, chat_id: int, text: str) -> bool:
         """Generate TTS audio and send as Telegram voice message."""
